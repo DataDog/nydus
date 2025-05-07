@@ -1,0 +1,213 @@
+name: Datadog Release
+
+on:
+  push:
+    tags:
+     - v*
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nydus-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup rust toolchain
+      run: rustup show
+    - name: Read Rust toolchain version
+      id: set_toolchain_version
+      run: |
+        RUST_TOOLCHAIN_VERSION=$(grep -oP '(?<=channel = ")[^"]*' rust-toolchain.toml)
+        echo "Rust toolchain version: $RUST_TOOLCHAIN_VERSION"
+        echo "rust-version=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_OUTPUT
+      shell: bash
+    - name: Build nydus-rs Non-RISC-V
+      if: matrix.arch != 'riscv64'
+      run: |
+        declare -A rust_target_map=( ["amd64"]="x86_64-unknown-linux-musl" ["arm64"]="aarch64-unknown-linux-musl")
+        RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
+        cargo install --locked --version 0.2.5 cross
+        make -e RUST_TARGET_STATIC=$RUST_TARGET -e CARGO=cross static-release
+    - name: Prepare to upload artifacts
+      run: |
+        declare -A rust_target_map=( ["amd64"]="x86_64-unknown-linux-musl" ["arm64"]="aarch64-unknown-linux-musl")
+        RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
+        sudo mv target/$RUST_TARGET/release/nydusd nydusd
+        sudo mv target/$RUST_TARGET/release/nydus-image .
+        sudo mv target/$RUST_TARGET/release/nydusctl .
+        sudo cp -r misc/configs .
+        sudo chown -R $(id -un):$(id -gn) . ~/.cargo/
+    - name: store-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nydus-artifacts-linux-${{ matrix.arch }}
+        path: |
+          nydusd
+          nydus-image
+          nydusctl
+          configs
+
+  contrib-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      DOCKER: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Golang
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.work'
+        cache-dependency-path: "**/*.sum"
+    - name: build contrib go components
+      run: |
+        make -e GOARCH=${{ matrix.arch }} contrib-release
+        sudo mv contrib/nydusify/cmd/nydusify .
+        sudo mv contrib/nydus-overlayfs/bin/nydus-overlayfs .
+    - name: store-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nydus-artifacts-linux-${{ matrix.arch }}-contrib
+        path: |
+          nydusify
+          nydus-overlayfs
+          containerd-nydus-grpc
+
+  prepare-tarball-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        os: [linux]
+    needs: [nydus-linux, contrib-linux]
+    steps:
+    - name: download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: nydus-artifacts-${{ matrix.os }}-${{ matrix.arch }}*
+        merge-multiple: true
+        path: nydus-static
+    - name: prepare release tarball
+      run: |
+        tag=$(echo $GITHUB_REF | cut -d/ -f3-)
+        tarball="nydus-static-$tag-${{ matrix.os }}-${{ matrix.arch }}.tgz"
+        chmod +x nydus-static/*
+        tar cf - nydus-static | gzip > ${tarball}
+        echo "tarball=${tarball}" >> $GITHUB_ENV
+
+        shasum="$tarball.sha256sum"
+        sha256sum $tarball > $shasum
+        echo "tarball_shasum=${shasum}" >> $GITHUB_ENV
+    - name: store-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nydus-release-tarball-${{ matrix.os }}-${{ matrix.arch }}
+        path: |
+          ${{ env.tarball }}
+          ${{ env.tarball_shasum }}
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [prepare-tarball-linux]
+    permissions:
+      contents: write
+    steps:
+    - name: download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: nydus-release-tarball-*
+        merge-multiple: true
+        path: nydus-tarball
+    - name: prepare release env
+      run: |
+        echo "tarballs<<EOF" >> $GITHUB_ENV
+        for I in $(ls nydus-tarball);do echo "nydus-tarball/${I}" >> $GITHUB_ENV; done
+        echo "EOF" >> $GITHUB_ENV
+        tag=$(echo $GITHUB_REF | cut -d/ -f3-)
+        echo "tag=${tag}" >> $GITHUB_ENV
+        cat $GITHUB_ENV
+    - name: push release
+      if: github.event_name == 'push'
+      uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+      with:
+        name: "Nydus Image Service ${{ env.tag }}"
+        body: |
+          New release for Datadog use.
+        generate_release_notes: true
+        files: |
+          ${{ env.tarballs }}
+
+  goreleaser:
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        os: [linux]
+    needs: [nydus-linux, contrib-linux]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.work'
+          cache-dependency-path: "**/*.sum"
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nydus-artifacts-${{ matrix.os }}-${{ matrix.arch }}*
+          merge-multiple: true
+          path: nydus-static
+      - name: prepare context
+        run: |
+          chmod +x nydus-static/*
+          export GOARCH=${{ matrix.arch }}
+          echo "GOARCH: $GOARCH"
+          sh ./goreleaser.sh
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        with:
+          version: latest
+          args: check
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        id: run-goreleaser
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate subject
+        id: hash
+        env:
+          ARTIFACTS: "${{ steps.run-goreleaser.outputs.artifacts }}"
+        run: |
+          set -euo pipefail
+          hashes=$(echo $ARTIFACTS | jq --raw-output '.[] | {name, "digest": (.extra.Digest // .extra.Checksum)} | select(.digest) | {digest} + {name} | join("  ") | sub("^sha256:";"")' | base64 -w0)
+          if test "$hashes" = ""; then # goreleaser < v1.13.0
+            checksum_file=$(echo "$ARTIFACTS" | jq -r '.[] | select (.type=="Checksum") | .path')
+            hashes=$(cat $checksum_file | base64 -w0)
+          fi
+          echo "hashes=$hashes" >> $GITHUB_OUTPUT
+
+      - name: Set tag output
+        id: tag
+        run: echo "tag_name=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
