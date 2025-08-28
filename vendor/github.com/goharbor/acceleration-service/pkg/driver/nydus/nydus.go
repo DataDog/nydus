@@ -352,7 +352,14 @@ func (d *Driver) makeManifestIndex(ctx context.Context, cs content.Store, oci, n
 		if desc.Platform == nil {
 			desc.Platform = &ocispec.Platform{}
 		}
-		desc.Platform.OSFeatures = []string{nydusutils.ManifestOSFeatureNydus}
+
+		/* BEGIN DATADOG PATCH */
+		// Deactivate the OSFeature field as it's causing issues with ECR
+		// desc.Platform.OSFeatures = []string{nydusutils.ManifestOSFeatureNydus}
+
+		// Add artifactType to identify the nydus descriptor, this field is accepted by ECR
+		desc.ArtifactType = "application/vnd.nydus.image.manifest.v1+json"
+		/* END DATADOG PATCH */
 		nydusDescs[idx] = desc
 	}
 

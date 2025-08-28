@@ -938,7 +938,10 @@ func convertIndex(ctx context.Context, cs content.Store, orgDesc ocispec.Descrip
 			// Skip the manifest which is not modified.
 			continue
 		}
-		manifest.Platform.OSFeatures = append(manifest.Platform.OSFeatures, ManifestOSFeatureNydus)
+		/* BEGIN DATADOG PATCH */
+		// Remove because unsupported by ECR
+		// manifest.Platform.OSFeatures = append(manifest.Platform.OSFeatures, ManifestOSFeatureNydus)
+		/* END DATADOG PATCH */
 		index.Manifests[i] = manifest
 	}
 
