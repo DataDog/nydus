@@ -125,6 +125,9 @@ type MergeOption struct {
 	Timeout *time.Duration
 	// Encrypt encrypts the bootstrap layer if it's specified.
 	Encrypt Encrypter
+	// MergeManifest indicates that the resulting nydus manifest will be merged with the original
+	// OCI one into a single index manifest.
+	MergeManifest bool
 }
 
 type UnpackOption struct {
