@@ -883,8 +883,12 @@ impl Registry {
             first: First::new(),
         };
 
-        registry.start_refresh_token_thread();
-        info!("Refresh token thread started.");
+        if config.enable_token_refresh {
+            registry.start_refresh_token_thread();
+            info!("Refresh token thread started.");
+        } else {
+            info!("Refresh token thread is disabled.");
+        }
 
         Ok(registry)
     }

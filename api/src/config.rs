@@ -626,6 +626,10 @@ pub struct RegistryConfig {
     /// Enable HTTP proxy for the read request.
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Enable background token refresh thread. Defaults to true.
+    /// When prefetch is enabled, this can be disabled as prefetch traffic will naturally refresh tokens.
+    #[serde(default = "default_enable_token_refresh")]
+    pub enable_token_refresh: bool,
 }
 
 /// Configuration information for blob cache manager.
@@ -1157,6 +1161,10 @@ fn default_http_timeout() -> u32 {
     5
 }
 
+fn default_enable_token_refresh() -> bool {
+    true
+}
+
 fn default_check_interval() -> u64 {
     5
 }
@@ -1364,7 +1372,7 @@ impl TryFrom<RafsConfig> for ConfigV2 {
     type Error = std::io::Error;
 
     fn try_from(v: RafsConfig) -> std::result::Result<Self, Self::Error> {
-        let backend: BackendConfigV2 = (&v.device.backend).try_into()?;
+        let mut backend: BackendConfigV2 = (&v.device.backend).try_into()?;
         let mut cache: CacheConfigV2 = (&v.device.cache).try_into()?;
         let rafs = RafsConfigV2 {
             mode: v.mode,
@@ -1378,6 +1386,13 @@ impl TryFrom<RafsConfig> for ConfigV2 {
         };
         if !cache.prefetch.enable && rafs.prefetch.enable {
             cache.prefetch = rafs.prefetch.clone();
+        }
+
+        // If prefetch is enabled, disable token refresh by default
+        if cache.prefetch.enable {
+            if let Some(registry) = backend.registry.as_mut() {
+                registry.enable_token_refresh = false;
+            }
         }
 
         Ok(ConfigV2 {
@@ -1509,10 +1524,19 @@ impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
             cache_validate: false,
             prefetch_config: v.prefetch_config.clone(),
         };
+        let mut backend: BackendConfigV2 = (&backend_config).try_into()?;
+
+        // If prefetch is enabled, disable token refresh by default
+        if cache_config.prefetch_config.enable {
+            if let Some(registry) = backend.registry.as_mut() {
+                registry.enable_token_refresh = false;
+            }
+        }
+
         Ok(BlobCacheEntryConfigV2 {
             version: 2,
             id: v.id.clone(),
-            backend: (&backend_config).try_into()?,
+            backend,
             external_backends: v.external_backends.clone(),
             cache: (&cache_config).try_into()?,
             metadata_path: v.metadata_path.clone(),
@@ -1722,11 +1746,13 @@ mod tests {
 	    "repo": "test/repo",
 	    "auth": "base64_encoded_auth",
 	    "registry_token": "bearer_token",
-	    "blob_redirected_host": "blob_redirected_host"
+	    "blob_redirected_host": "blob_redirected_host",
+        "enable_token_refresh": false
         }"#;
         let config: RegistryConfig = serde_json::from_str(content).unwrap();
         assert_eq!(config.scheme, "http");
         assert!(config.skip_verify);
+        assert!(!config.enable_token_refresh);
     }
 
     #[test]
@@ -1878,6 +1904,7 @@ mod tests {
         connect_timeout = 10
         retry_limit = 5
         registry_token = "bear_token"
+        enable_token_refresh = false
         blob_url_scheme = "https"
         blob_redirected_host = "redirect.registry.com"
         [backend.registry.proxy]
@@ -1906,6 +1933,7 @@ mod tests {
         assert_eq!(registry.connect_timeout, 10);
         assert_eq!(registry.retry_limit, 5);
         assert_eq!(registry.registry_token.as_ref().unwrap(), "bear_token");
+        assert!(!registry.enable_token_refresh);
         assert_eq!(registry.blob_url_scheme, "https");
         assert_eq!(registry.blob_redirected_host, "redirect.registry.com");
 
@@ -2099,6 +2127,15 @@ mod tests {
         "#;
         let config = ConfigV2::from_str(content).unwrap();
         assert_eq!(&config.id, "");
+        // token refresh should be disabled when prefetch is enabled
+        assert!(
+            !config
+                .get_backend_config()
+                .unwrap()
+                .get_registry_config()
+                .unwrap()
+                .enable_token_refresh
+        );
     }
 
     #[test]
