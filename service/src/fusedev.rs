@@ -5,12 +5,13 @@
 
 //! Nydus FUSE filesystem daemon.
 
+use core::option::Option::None;
+use nydus_rafs::metadata::{RafsInode, RafsInodeWalkAction};
 use std::any::Any;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::metadata;
 use std::io::{Error, ErrorKind, Result, Write};
 use std::ops::Deref;
-use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "linux")]
@@ -30,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fuse_backend_rs::abi::fuse_abi::{InHeader, OutHeader};
 use fuse_backend_rs::api::server::{MetricsHook, Server};
 use fuse_backend_rs::api::Vfs;
-use fuse_backend_rs::transport::{FuseChannel, FuseDevWriter, FuseSession};
+use fuse_backend_rs::transport::{FuseChannel, FuseSession, FuseSessionExt};
 use mio::Waker;
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
@@ -43,7 +44,9 @@ use crate::daemon::{
 };
 use crate::fs_service::{FsBackendCollection, FsBackendMountCmd, FsService};
 use crate::upgrade::{self, FailoverPolicy, UpgradeManager};
-use crate::{Error as NydusError, FsBackendType, Result as NydusResult};
+use crate::{Error as NydusError, FsBackendType, FuseNotifyError, Result as NydusResult};
+
+const FS_IDX_SHIFT: u64 = 56;
 
 #[derive(Serialize)]
 struct FuseOp {
@@ -157,19 +160,14 @@ impl<'a> FusedevNotifier<'a> {
     }
 
     fn notify_resend(&self) -> NydusResult<()> {
-        let session = self.session.lock().unwrap();
-        let file = session
-            .get_fuse_file()
-            .ok_or(NydusError::FuseDeviceNotFound)?;
-
-        let fd = file.as_raw_fd();
-        let mut buf = vec![0u8; session.bufsize()];
-        let writer: FuseDevWriter = FuseDevWriter::new(fd, &mut buf)?;
-
-        self.server
-            .notify_resend(writer)
-            .map_err(NydusError::FuseWriteError)?;
-        Ok(())
+        let mut session = self.session.lock().unwrap();
+        session
+            .try_with_writer(|writer| {
+                self.server
+                    .notify_resend(writer)
+                    .map_err(FuseNotifyError::FuseWriteError)
+            })
+            .map_err(NydusError::NotifyError)
     }
 }
 
@@ -186,7 +184,11 @@ impl<'a> FuseSysfsNotifier<'a> {
         vec!["/proc/sys/fs/fuse/connections", "/sys/fs/fuse/connections"]
     }
 
-    fn try_notify_with_path(&self, base_path: &str, event: &str) -> NydusResult<()> {
+    fn try_notify_with_path(
+        &self,
+        base_path: &str,
+        event: &str,
+    ) -> std::result::Result<(), FuseNotifyError> {
         let path = PathBuf::from(base_path)
             .join(self.conn.load(Ordering::Acquire).to_string())
             .join(event);
@@ -194,9 +196,10 @@ impl<'a> FuseSysfsNotifier<'a> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
-            .map_err(NydusError::SysfsOpenError)?;
+            .map_err(FuseNotifyError::SysfsOpenError)?;
 
-        file.write_all(b"1").map_err(NydusError::SysfsWriteError)?;
+        file.write_all(b"1")
+            .map_err(FuseNotifyError::SysfsWriteError)?;
         Ok(())
     }
 
@@ -207,8 +210,8 @@ impl<'a> FuseSysfsNotifier<'a> {
             match self.try_notify_with_path(path, event) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if !matches!(e, NydusError::SysfsOpenError(_)) || idx == paths.len() - 1 {
-                        return Err(e);
+                    if !matches!(e, FuseNotifyError::SysfsOpenError(_)) || idx == paths.len() - 1 {
+                        return Err(e.into());
                     }
                 }
             }
@@ -333,6 +336,65 @@ impl FsService for FusedevFsService {
             let resp = serde_json::to_string(&r).map_err(NydusError::Serde)?;
             Ok(Some(resp))
         }
+    }
+
+    /// Recursively walk the inode tree and send cache invalidation notifications.
+    fn walk_and_notify_invalidation(
+        &self,
+        parent_kernel_ino: u64,
+        cur_name: &str,
+        cur_inode: Arc<dyn RafsInode>,
+        fs_idx: u8,
+    ) -> NydusResult<()> {
+        let cur_kernel_ino = ((fs_idx as u64) << FS_IDX_SHIFT) | cur_inode.ino();
+
+        if cur_inode.is_dir() {
+            let mut handler =
+                |child: Option<Arc<dyn RafsInode>>, name: OsString, _ino: u64, _offset: u64| {
+                    if name != OsStr::new(".") && name != OsStr::new("..") {
+                        if let Some(child_inode) = child {
+                            let child_name = name.to_string_lossy().to_string();
+                            // Recursive call
+                            if let Err(e) = self.walk_and_notify_invalidation(
+                                cur_kernel_ino,
+                                &child_name,
+                                child_inode,
+                                fs_idx,
+                            ) {
+                                warn!("recursive walk failed for {}: {:?}", child_name, e);
+                            }
+                        }
+                    }
+                    Ok(RafsInodeWalkAction::Continue)
+                };
+
+            cur_inode.walk_children_inodes(0, &mut handler)?;
+        }
+
+        // === Post-order: invalidate cache of the current node ===
+        let cstr_name = CString::new(cur_name).map_err(|_| eother!("invalid file name"))?;
+        // Invalidate inode cache
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
+                warn!("notify_inval_inode failed: {} {:?}", cur_name, e);
+            }
+        });
+
+        self.session.lock().unwrap().with_writer(|writer| {
+            if let Err(e) =
+                self.server
+                    .notify_inval_entry(writer, parent_kernel_ino, cstr_name.as_c_str())
+            {
+                warn!("notify_inval_entry failed: {} {:?}", cur_name, e);
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Check whether the filesystem service is a FUSE service.
+    fn is_fuse(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn Any {
