@@ -203,6 +203,8 @@ struct RegistryState {
     blob_url_scheme: String,
     // Replace registry redirected url host with the given host
     blob_redirected_host: String,
+    // Prevent automatic fallback from HTTPS to HTTP on TLS errors
+    skip_http_fallback: bool,
     // Cache bearer token (get from registry authentication server) or basic authentication auth string.
     // We need use it to reduce the pressure on token authentication server or reduce the base64 compute workload for every request.
     // Use RwLock here to avoid using mut backend trait object.
@@ -238,6 +240,9 @@ impl RegistryState {
     }
 
     fn needs_fallback_http(&self, e: &dyn Error) -> bool {
+        if self.skip_http_fallback {
+            return false;
+        }
         match e.source() {
             Some(err) => match err.source() {
                 Some(err) => {
@@ -886,6 +891,7 @@ impl Registry {
             retry_limit,
             blob_url_scheme: config.blob_url_scheme.clone(),
             blob_redirected_host: config.blob_redirected_host.clone(),
+            skip_http_fallback: config.skip_http_fallback,
             cached_auth_using_http_get: HashCache::new(),
             cached_redirect: HashCache::new(),
             token_expired_at: ArcSwapOption::new(None),
@@ -1072,6 +1078,7 @@ mod tests {
             retry_limit: 5,
             blob_url_scheme: "https".to_string(),
             blob_redirected_host: "oss.alibaba-inc.com".to_string(),
+            skip_http_fallback: false,
             cached_auth_using_http_get: Default::default(),
             cached_auth: Default::default(),
             cached_redirect: Default::default(),
