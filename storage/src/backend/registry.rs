@@ -32,6 +32,7 @@ const HEADER_AUTHORIZATION: &str = "Authorization";
 const HEADER_WWW_AUTHENTICATE: &str = "www-authenticate";
 
 const REGISTRY_DEFAULT_TOKEN_EXPIRATION: u64 = 10 * 60; // in seconds
+const REGISTRY_CONFIG_POLL_INTERVAL: u64 = 5; // in seconds
 
 /// Error codes related to registry storage backend operations.
 #[derive(Debug)]
@@ -85,6 +86,12 @@ impl Cache {
             *cached_guard = current;
         }
     }
+}
+
+enum ConfigAuthUpdate {
+    Clear,
+    Basic(String),
+    RefreshBearer(BearerAuth),
 }
 
 #[derive(Default)]
@@ -199,18 +206,21 @@ struct RegistryState {
     repo: String,
     // Retry limit for read operation
     retry_limit: u8,
+    // When true, skip TLS certificate verification AND allow HTTPS-to-HTTP fallback.
+    // When false (default), TLS errors propagate as-is without falling back to HTTP.
+    skip_verify: bool,
     // Scheme specified for blob server
     blob_url_scheme: String,
     // Replace registry redirected url host with the given host
     blob_redirected_host: String,
-    // Prevent automatic fallback from HTTPS to HTTP on TLS errors
-    skip_http_fallback: bool,
     // Cache bearer token (get from registry authentication server) or basic authentication auth string.
     // We need use it to reduce the pressure on token authentication server or reduce the base64 compute workload for every request.
     // Use RwLock here to avoid using mut backend trait object.
     // Example: RwLock<"Bearer <token>">
     //          RwLock<"Basic base64(<username:password>)">
     cached_auth: Cache,
+    // Cache the last registry_auth value observed from the dynamic config API.
+    cached_config_auth: Cache,
     // Cache for the HTTP method when getting auth, it is "true" when using "GET" method.
     // Due to the different implementations of various image registries, auth requests
     // may use the GET or POST methods, we need to cache the method after the
@@ -240,7 +250,7 @@ impl RegistryState {
     }
 
     fn needs_fallback_http(&self, e: &dyn Error) -> bool {
-        if self.skip_http_fallback {
+        if !self.skip_verify {
             return false;
         }
         match e.source() {
@@ -279,6 +289,68 @@ impl RegistryState {
                 &nydus_utils::config::Keys::RegistryAuth,
                 auth.clone(),
             );
+        }
+    }
+
+    fn clear_cached_auth(&self) {
+        let last_cached_auth = self.cached_auth.get();
+        self.cached_auth.set(&last_cached_auth, String::new());
+        self.token_expired_at.store(None);
+    }
+
+    fn detect_config_auth_update(&self) -> Option<ConfigAuthUpdate> {
+        let last_config_auth = self.cached_config_auth.get();
+        let (config_auth, changed) = nydus_utils::config::get_changed(
+            &self.id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            &last_config_auth,
+        );
+        if !changed {
+            return None;
+        }
+
+        self.cached_config_auth
+            .set(&last_config_auth, config_auth.clone());
+
+        if config_auth.is_empty() {
+            return Some(ConfigAuthUpdate::Clear);
+        }
+
+        if let Some(cached_bearer_auth) = self.cached_bearer_auth.load().as_deref() {
+            return Some(ConfigAuthUpdate::RefreshBearer(
+                cached_bearer_auth.to_owned(),
+            ));
+        }
+
+        Some(ConfigAuthUpdate::Basic(config_auth))
+    }
+
+    fn refresh_cached_auth_from_config(&self, connection: &Arc<Connection>) {
+        match self.detect_config_auth_update() {
+            None => {}
+            Some(ConfigAuthUpdate::Clear) => self.clear_cached_auth(),
+            Some(ConfigAuthUpdate::Basic(config_auth)) => {
+                let last_cached_auth = self.cached_auth.get();
+                self.cached_auth
+                    .set(&last_cached_auth, format!("Basic {}", config_auth));
+                self.token_expired_at.store(None);
+                debug!("refreshed basic registry auth after registry_auth config update");
+            }
+            Some(ConfigAuthUpdate::RefreshBearer(auth)) => match self.get_token(auth, connection) {
+                Ok(token) => {
+                    let last_cached_auth = self.cached_auth.get();
+                    self.cached_auth
+                        .set(&last_cached_auth, format!("Bearer {}", token.token));
+                    debug!("refreshed bearer registry token after registry_auth config update");
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to refresh registry token after registry_auth config update: {}",
+                        err
+                    );
+                    self.clear_cached_auth();
+                }
+            },
         }
     }
 
@@ -888,10 +960,11 @@ impl Registry {
             host: config.host.clone(),
             repo: config.repo.clone(),
             cached_auth,
+            cached_config_auth: Cache::new(auth.clone().unwrap_or_default()),
             retry_limit,
+            skip_verify: config.skip_verify,
             blob_url_scheme: config.blob_url_scheme.clone(),
             blob_redirected_host: config.blob_redirected_host.clone(),
-            skip_http_fallback: config.skip_http_fallback,
             cached_auth_using_http_get: HashCache::new(),
             cached_redirect: HashCache::new(),
             token_expired_at: ArcSwapOption::new(None),
@@ -906,12 +979,8 @@ impl Registry {
             first: First::new(),
         };
 
-        if config.disable_token_refresh {
-            info!("Refresh token thread is disabled.");
-        } else {
-            registry.start_refresh_token_thread();
-            info!("Refresh token thread started.");
-        }
+        registry.start_refresh_token_thread();
+        info!("Refresh token thread started.");
 
         Ok(registry)
     }
@@ -947,6 +1016,9 @@ impl Registry {
         let mut refresh_interval = REGISTRY_DEFAULT_TOKEN_EXPIRATION;
         thread::spawn(move || {
             loop {
+                // Check for config auth changes every tick.
+                state.refresh_cached_auth_from_config(&conn);
+
                 if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     if let Some(token_expired_at) = state.token_expired_at.load().as_deref() {
                         // If the token will expire within the next refresh interval,
@@ -985,7 +1057,7 @@ impl Registry {
                 if conn.shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                thread::sleep(Duration::from_secs(refresh_interval));
+                thread::sleep(Duration::from_secs(REGISTRY_CONFIG_POLL_INTERVAL));
                 if conn.shutdown.load(Ordering::Acquire) {
                     break;
                 }
@@ -1039,9 +1111,64 @@ fn trim(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::error::Error as StdError;
+    use std::fmt::{Display, Formatter};
 
     #[cfg(feature = "backend-registry")]
     use http;
+
+    #[derive(Debug)]
+    struct NestedErr {
+        msg: &'static str,
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    }
+
+    impl Display for NestedErr {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl StdError for NestedErr {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_ref()
+                .map(|source| &**source as &(dyn StdError + 'static))
+        }
+    }
+
+    fn create_state(use_https: bool) -> RegistryState {
+        create_state_with_skip_verify(use_https, false)
+    }
+
+    fn create_state_with_skip_verify(use_https: bool, skip_verify: bool) -> RegistryState {
+        RegistryState {
+            id: String::from("/"),
+            scheme: Scheme::new(use_https),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(None),
+        }
+    }
+
+    fn nested_error(msg: &'static str) -> NestedErr {
+        NestedErr {
+            msg: "outer",
+            source: Some(Box::new(NestedErr {
+                msg: "middle",
+                source: Some(Box::new(NestedErr { msg, source: None })),
+            })),
+        }
+    }
 
     #[test]
     fn test_string_cache() {
@@ -1069,6 +1196,129 @@ mod tests {
     }
 
     #[test]
+    fn test_no_fallback_http_by_default() {
+        // With skip_verify=false (default), never fall back to http.
+        let state = create_state(true);
+        assert_eq!(state.scheme.to_string(), "https");
+        assert!(!state.needs_fallback_http(&nested_error("wrong version number")));
+        assert!(!state.needs_fallback_http(&nested_error("SSL routines")));
+    }
+
+    #[test]
+    fn test_scheme_and_fallback_http() {
+        // With skip_verify=true and https, TLS errors trigger fallback.
+        let state = create_state_with_skip_verify(true, true);
+        assert_eq!(state.scheme.to_string(), "https");
+        assert!(state.needs_fallback_http(&nested_error("wrong version number")));
+        assert!(state.needs_fallback_http(&nested_error("SSL routines")));
+        assert!(!state.needs_fallback_http(&nested_error("permission denied")));
+
+        // With skip_verify=true and http, no fallback needed (already http).
+        let state = create_state_with_skip_verify(false, true);
+        assert_eq!(state.scheme.to_string(), "http");
+        assert!(!state.needs_fallback_http(&nested_error("wrong version number")));
+    }
+
+    #[test]
+    fn test_validate_authorization_info() {
+        assert!(Registry::validate_authorization_info(&None).is_ok());
+
+        let valid = Some(base64::engine::general_purpose::STANDARD.encode("user:pass"));
+        assert!(Registry::validate_authorization_info(&valid).is_ok());
+
+        let invalid_base64 = Some("%%%".to_string());
+        assert!(Registry::validate_authorization_info(&invalid_base64).is_err());
+
+        let invalid_utf8 = Some(base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe]));
+        assert!(Registry::validate_authorization_info(&invalid_utf8).is_err());
+
+        let missing_colon = Some(base64::engine::general_purpose::STANDARD.encode("useronly"));
+        assert!(Registry::validate_authorization_info(&missing_colon).is_err());
+    }
+
+    #[test]
+    fn test_detect_config_auth_update_basic() {
+        let id = "/test-detect-config-auth-update-basic";
+        let state = RegistryState {
+            id: id.to_string(),
+            scheme: Scheme::new(true),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify: false,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(None),
+        };
+
+        nydus_utils::config::set(
+            id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            "dGVzdDp0ZXN0".to_string(),
+        );
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::Basic(auth)) => assert_eq!(auth, "dGVzdDp0ZXN0"),
+            _ => panic!("unexpected config auth update result"),
+        }
+        assert!(state.detect_config_auth_update().is_none());
+
+        nydus_utils::config::remove(id, &nydus_utils::config::Keys::RegistryAuth);
+    }
+
+    #[test]
+    fn test_detect_config_auth_update_clear_and_refresh_bearer() {
+        let id = "/test-detect-config-auth-update-refresh-bearer";
+        let state = RegistryState {
+            id: id.to_string(),
+            scheme: Scheme::new(true),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify: false,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Cache::new("old-auth".to_string()),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(Some(Arc::new(BearerAuth {
+                realm: "https://auth.example.com/token".to_string(),
+                service: "example.com".to_string(),
+                scope: "repository:library/test:pull".to_string(),
+            }))),
+        };
+
+        nydus_utils::config::set(
+            id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            "bmV3LWF1dGg=".to_string(),
+        );
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::RefreshBearer(auth)) => {
+                assert_eq!(auth.realm, "https://auth.example.com/token");
+                assert_eq!(auth.service, "example.com");
+                assert_eq!(auth.scope, "repository:library/test:pull");
+            }
+            _ => panic!("unexpected config auth update result"),
+        }
+
+        nydus_utils::config::remove(id, &nydus_utils::config::Keys::RegistryAuth);
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::Clear) => {}
+            _ => panic!("unexpected config auth clear result"),
+        }
+    }
+
+    #[test]
     fn test_state_url() {
         let state = RegistryState {
             id: String::from("/"),
@@ -1076,11 +1326,12 @@ mod tests {
             host: "alibaba-inc.com".to_string(),
             repo: "nydus".to_string(),
             retry_limit: 5,
+            skip_verify: false,
             blob_url_scheme: "https".to_string(),
             blob_redirected_host: "oss.alibaba-inc.com".to_string(),
-            skip_http_fallback: false,
             cached_auth_using_http_get: Default::default(),
             cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
@@ -1134,6 +1385,29 @@ mod tests {
         let str = "Base realm=\"https://auth.my-registry.com/token\"";
         let header = HeaderValue::from_str(str).unwrap();
         assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("Basic realm");
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("");
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static(
+            "Bearer realm=\"https://auth.my-registry.com/token\",scope=\"repository:test/repo:pull\"",
+        );
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static(
+            "Bearer service=\"my-registry.com\",scope=\"repository:test/repo:pull\"",
+        );
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("Basic realm=\"harbor\"");
+        let auth = RegistryState::parse_auth(&header).unwrap();
+        match auth {
+            Auth::Basic(auth) => assert_eq!(&auth.realm, "harbor"),
+            _ => panic!("failed to parse `Basic` authentication header with explicit realm"),
+        }
     }
 
     #[test]

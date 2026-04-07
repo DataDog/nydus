@@ -11,7 +11,7 @@ use std::convert::{TryFrom, TryInto};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::fs::OpenOptions;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -64,6 +64,17 @@ pub const RAFS_MAX_METADATA_SIZE: usize = 0x8000_0000;
 pub const DOT: &str = ".";
 /// File name for Unix parent directory.
 pub const DOTDOT: &str = "..";
+
+#[allow(clippy::useless_conversion)]
+#[inline]
+pub fn mode_bits(mode: libc::mode_t) -> u32 {
+    u32::from(mode)
+}
+
+#[inline]
+pub fn file_type_bits(mode: u32) -> u32 {
+    mode & mode_bits(libc::S_IFMT)
+}
 
 /// Type for RAFS filesystem inode number.
 pub type Inode = u64;
@@ -824,7 +835,7 @@ impl RafsSuper {
             return Ok(());
         }
 
-        Err(Error::new(ErrorKind::Other, "invalid RAFS superblock"))
+        Err(Error::other("invalid RAFS superblock"))
     }
 
     /// Set meta blob file path from which the `RafsSuper` object is loaded from.
@@ -930,7 +941,7 @@ impl RafsSuper {
     /// metadata in advance. There are ways to configure the file list to be prefetched.
     /// 1. Static file prefetch list configured during image building, recorded in prefetch list
     ///    in Rafs v5 file system metadata.
-    ///     Base on prefetch table which is persisted to bootstrap when building image.
+    ///    Base on prefetch table which is persisted to bootstrap when building image.
     /// 2. Dynamic file prefetch list configured by command line. The dynamic file prefetch list
     ///    has higher priority and the static file prefetch list will be ignored if there's dynamic
     ///    prefetch list. When a directory is specified for dynamic prefetch list, all sub directory
@@ -1263,7 +1274,7 @@ mod tests {
     #[test]
     fn test_rafs_super_config_check_compatibility_fail() {
         let meta1 = get_meta(
-            1024 as u32,
+            1024_u32,
             true,
             true,
             RafsSuperFlags::HASH_BLAKE3,
@@ -1272,7 +1283,7 @@ mod tests {
             RAFS_SUPER_VERSION_V5,
         );
         let meta2 = get_meta(
-            2048 as u32,
+            2048_u32,
             true,
             true,
             RafsSuperFlags::HASH_BLAKE3,
@@ -1281,7 +1292,7 @@ mod tests {
             RAFS_SUPER_VERSION_V5,
         );
         let meta3 = get_meta(
-            1024 as u32,
+            1024_u32,
             false,
             true,
             RafsSuperFlags::HASH_BLAKE3,
@@ -1290,7 +1301,7 @@ mod tests {
             RAFS_SUPER_VERSION_V5,
         );
         let meta4 = get_meta(
-            1024 as u32,
+            1024_u32,
             true,
             false,
             RafsSuperFlags::HASH_BLAKE3,
@@ -1299,7 +1310,7 @@ mod tests {
             RAFS_SUPER_VERSION_V5,
         );
         let meta5 = get_meta(
-            1024 as u32,
+            1024_u32,
             true,
             true,
             RafsSuperFlags::HASH_SHA256,
@@ -1308,7 +1319,7 @@ mod tests {
             RAFS_SUPER_VERSION_V5,
         );
         let meta6 = get_meta(
-            1024 as u32,
+            1024_u32,
             true,
             true,
             RafsSuperFlags::HASH_BLAKE3,

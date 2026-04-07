@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Result};
 use std::mem::ManuallyDrop;
+#[cfg(feature = "dedup")]
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -236,16 +237,16 @@ impl FileCacheEntry {
     }
 
     fn delay_persist_chunk_data(&self, chunk: Arc<dyn BlobChunkInfo>, buffer: Arc<DataBuffer>) {
-        let blob_info = self.blob_info.clone();
+        let _blob_info = self.blob_info.clone();
         let delayed_chunk_map = self.chunk_map.clone();
         let file = self.file.clone();
-        let file_path = self.file_path.clone();
+        let _file_path = self.file_path.clone();
         let metrics = self.metrics.clone();
         let is_raw_data = self.is_raw_data;
         let is_cache_encrypted = self.is_cache_encrypted;
         let cipher_object = self.cache_cipher_object.clone();
         let cipher_context = self.cache_cipher_context.clone();
-        let cas_mgr = self.cas_mgr.clone();
+        let _cas_mgr = self.cas_mgr.clone();
 
         metrics.buffered_backend_size.add(buffer.size() as u64);
         self.runtime.spawn_blocking(move || {
@@ -304,8 +305,8 @@ impl FileCacheEntry {
                 &metrics,
             );
             #[cfg(feature = "dedup")]
-            if let Some(mgr) = cas_mgr {
-                if let Err(e) = mgr.record_chunk(&blob_info, chunk.deref(), file_path.as_ref()) {
+            if let Some(mgr) = _cas_mgr {
+                if let Err(e) = mgr.record_chunk(&_blob_info, chunk.deref(), _file_path.as_ref()) {
                     warn!(
                         "failed to record chunk state for dedup in delay_persist_chunk_data, {}",
                         e
@@ -662,11 +663,8 @@ impl BlobCache for FileCacheEntry {
     ) -> StorageResult<usize> {
         // Handle blob prefetch request first, it may help performance.
         for req in prefetches {
-            let msg = AsyncPrefetchMessage::new_blob_prefetch(
-                blob_cache.clone(),
-                req.offset as u64,
-                req.len as u64,
-            );
+            let msg =
+                AsyncPrefetchMessage::new_blob_prefetch(blob_cache.clone(), req.offset, req.len);
             let _ = self.workers.send_prefetch_message(msg);
         }
 
@@ -678,7 +676,7 @@ impl BlobCache for FileCacheEntry {
         BlobIoMergeState::merge_and_issue(
             &bios,
             max_comp_size,
-            max_comp_size as u64 >> RAFS_BATCH_SIZE_TO_GAP_SHIFT,
+            max_comp_size >> RAFS_BATCH_SIZE_TO_GAP_SHIFT,
             |req: BlobIoRange| {
                 let msg = AsyncPrefetchMessage::new_fs_prefetch(blob_cache.clone(), req);
                 let _ = self.workers.send_prefetch_message(msg);
@@ -1084,6 +1082,7 @@ impl FileCacheEntry {
         trace!("dispatch single io range {:?}", req);
         let mut blob_cci = BlobCCI::new();
         for (i, chunk) in req.chunks.iter().enumerate() {
+            #[allow(unused_mut)]
             let mut is_ready = match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
                 Ok(true) => true,
                 Ok(false) => false,
@@ -1774,9 +1773,22 @@ mod tests {
         let buf2 = unsafe { DataBuffer::from_mut_slice(buf1.as_mut_slice()) };
 
         assert_eq!(buf2.slice()[1], 0x1);
+        assert_eq!(buf2.size(), 0);
         let mut buf2 = buf2.convert_to_owned_buffer();
         buf2.mut_slice()[1] = 0x2;
         assert_eq!(buf1[1], 0x1);
+        assert!(buf2.size() >= buf2.slice().len());
+    }
+
+    #[test]
+    fn test_data_buffer_already_allocated() {
+        // Covers the `else` branch of convert_to_owned_buffer (Allocated passthrough)
+        let data = vec![0x42u8; 16];
+        let buf = DataBuffer::Allocated(data);
+        assert_eq!(buf.size(), 16);
+        let converted = buf.convert_to_owned_buffer();
+        assert_eq!(converted.slice()[0], 0x42);
+        assert!(converted.size() >= 16);
     }
 
     #[test]
@@ -1851,6 +1863,17 @@ mod tests {
         assert_eq!(region.tags.len(), 0);
         assert!(!region.seg.is_empty());
         assert!(region.has_user_io());
+
+        let chunk: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
+            index: 1,
+            ..Default::default()
+        });
+        region
+            .append(0x6000, 0x1000, BlobIoTag::Internal, Some(chunk.clone()))
+            .unwrap();
+        assert_eq!(region.chunks.len(), 1);
+        assert_eq!(region.tags, vec![false]);
+        assert_eq!(region.chunks[0].id(), chunk.id());
     }
 
     #[test]
@@ -1884,6 +1907,53 @@ mod tests {
             .push(RegionType::CacheSlow, 0x5000, 0x2000, tag, None)
             .unwrap();
         assert_eq!(state.regions.len(), 2);
+
+        state.commit();
+        let tag = BlobIoTag::User(BlobIoSegment {
+            offset: 0x2000,
+            len: 0x1000,
+        });
+        state
+            .push(RegionType::CacheSlow, 0x7000, 0x1000, tag, None)
+            .unwrap();
+        assert_eq!(state.regions.len(), 3);
+
+        state.reset();
+        assert!(state.regions.is_empty());
+    }
+
+    #[test]
+    fn test_file_io_merge_state_splits_non_contiguous_user_io() {
+        let mut state = FileIoMergeState::new();
+
+        state
+            .push(
+                RegionType::Backend,
+                0x1000,
+                0x1000,
+                BlobIoTag::User(BlobIoSegment {
+                    offset: 0,
+                    len: 0x800,
+                }),
+                None,
+            )
+            .unwrap();
+        state
+            .push(
+                RegionType::Backend,
+                0x2000,
+                0x1000,
+                BlobIoTag::User(BlobIoSegment {
+                    offset: 0x100,
+                    len: 0x800,
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(state.regions.len(), 2);
+        assert_eq!(state.regions[0].r#type, RegionType::Backend);
+        assert_eq!(state.regions[1].r#type, RegionType::Backend);
     }
 
     #[test]
@@ -2043,5 +2113,70 @@ mod tests {
             5,
             "entries_count should be incremented to 5 after multiple successful updates"
         );
+    }
+
+    #[test]
+    fn test_file_cache_meta_get_blob_meta_immediate_success() {
+        let meta = Arc::new(BlobCompressionContextInfo {
+            state: Arc::new(BlobCompressionContext::default()),
+        });
+        let file_cache_meta = FileCacheMeta {
+            has_error: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(Mutex::new(Some(meta.clone()))),
+        };
+
+        let result = file_cache_meta.get_blob_meta();
+        assert!(result.is_some());
+        assert!(Arc::ptr_eq(&result.unwrap(), &meta));
+    }
+
+    #[test]
+    fn test_file_cache_meta_get_blob_meta_waits_until_meta_ready() {
+        let file_cache_meta = FileCacheMeta {
+            has_error: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(Mutex::new(None)),
+        };
+        let meta_clone = file_cache_meta.clone();
+        let expected = Arc::new(BlobCompressionContextInfo {
+            state: Arc::new(BlobCompressionContext::default()),
+        });
+        let expected_clone = expected.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            *meta_clone.meta.lock().unwrap() = Some(expected_clone);
+        });
+
+        let result = file_cache_meta.get_blob_meta();
+        assert!(result.is_some());
+        assert!(Arc::ptr_eq(&result.unwrap(), &expected));
+    }
+
+    #[test]
+    fn test_file_cache_meta_get_blob_meta_returns_none_on_error() {
+        let file_cache_meta = FileCacheMeta {
+            has_error: Arc::new(AtomicBool::new(true)),
+            meta: Arc::new(Mutex::new(None)),
+        };
+
+        assert!(file_cache_meta.get_blob_meta().is_none());
+    }
+
+    #[test]
+    fn test_file_cache_meta_clone_shares_state() {
+        let file_cache_meta = FileCacheMeta {
+            has_error: Arc::new(AtomicBool::new(false)),
+            meta: Arc::new(Mutex::new(None)),
+        };
+        let cloned = file_cache_meta.clone();
+        let shared = Arc::new(BlobCompressionContextInfo {
+            state: Arc::new(BlobCompressionContext::default()),
+        });
+
+        *cloned.meta.lock().unwrap() = Some(shared.clone());
+        assert!(Arc::ptr_eq(
+            &file_cache_meta.get_blob_meta().unwrap(),
+            &shared,
+        ));
     }
 }

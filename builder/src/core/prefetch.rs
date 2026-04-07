@@ -15,8 +15,9 @@ use super::node::Node;
 use crate::core::tree::TreeNode;
 
 /// Filesystem data prefetch policy.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PrefetchPolicy {
+    #[default]
     None,
     /// Prefetch will be issued from Fs layer, which leverages inode/chunkinfo to prefetch data
     /// from blob no matter where it resides(OSS/Localfs). Basically, it is willing to cache the
@@ -26,12 +27,6 @@ pub enum PrefetchPolicy {
     Fs,
     /// Prefetch will be issued directly from backend/blob layer
     Blob,
-}
-
-impl Default for PrefetchPolicy {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl FromStr for PrefetchPolicy {
@@ -324,7 +319,7 @@ mod tests {
             files_non_prefetch: Vec::with_capacity(10),
         };
         let mut inode = InodeWrapper::new(RafsVersion::V6);
-        inode.set_mode(0o755 | libc::S_IFREG as u32);
+        inode.set_mode(0o755 | crate::mode_bits(libc::S_IFREG));
         inode.set_size(1);
 
         let info = NodeInfo::default();
@@ -357,7 +352,7 @@ mod tests {
         prefetch.insert(&node4, &node4.borrow());
 
         let inode5 = inode.clone();
-        inode.set_mode(0o755 | libc::S_IFDIR as u32);
+        inode.set_mode(0o755 | crate::mode_bits(libc::S_IFDIR));
         inode.set_size(0);
         let mut info5 = info;
         info5.target = PathBuf::from("/a/b/d");
