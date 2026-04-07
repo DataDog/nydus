@@ -92,10 +92,7 @@ impl ConfigV2 {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let md = fs::metadata(path.as_ref())?;
         if md.len() > 0x100000 {
-            return Err(Error::new(
-                ErrorKind::Other,
-                "configuration file size is too big",
-            ));
+            return Err(Error::other("configuration file size is too big"));
         }
         let content = fs::read_to_string(path)?;
         Self::from_str(&content)
@@ -611,6 +608,7 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub auth: Option<String>,
     /// Skip SSL certificate validation for HTTPS scheme.
+    /// When true, also allows automatic HTTPS-to-HTTP fallback on TLS errors.
     #[serde(default)]
     pub skip_verify: bool,
     /// Drop the read request once http request timeout, in seconds.
@@ -1418,7 +1416,7 @@ impl TryFrom<RafsConfig> for ConfigV2 {
     type Error = std::io::Error;
 
     fn try_from(v: RafsConfig) -> std::result::Result<Self, Self::Error> {
-        let mut backend: BackendConfigV2 = (&v.device.backend).try_into()?;
+        let backend: BackendConfigV2 = (&v.device.backend).try_into()?;
         let mut cache: CacheConfigV2 = (&v.device.cache).try_into()?;
         let rafs = RafsConfigV2 {
             mode: v.mode,
@@ -1432,13 +1430,6 @@ impl TryFrom<RafsConfig> for ConfigV2 {
         };
         if !cache.prefetch.enable && rafs.prefetch.enable {
             cache.prefetch = rafs.prefetch.clone();
-        }
-
-        // If prefetch is enabled, disable token refresh by default
-        if cache.prefetch.enable {
-            if let Some(registry) = backend.registry.as_mut() {
-                registry.disable_token_refresh = true;
-            }
         }
 
         Ok(ConfigV2 {
@@ -1570,19 +1561,11 @@ impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
             cache_validate: false,
             prefetch_config: v.prefetch_config.clone(),
         };
-        let mut backend: BackendConfigV2 = (&backend_config).try_into()?;
-
-        // If prefetch is enabled, disable token refresh by default
-        if cache_config.prefetch_config.enable {
-            if let Some(registry) = backend.registry.as_mut() {
-                registry.disable_token_refresh = true;
-            }
-        }
 
         Ok(BlobCacheEntryConfigV2 {
             version: 2,
             id: v.id.clone(),
-            backend,
+            backend: (&backend_config).try_into()?,
             external_backends: v.external_backends.clone(),
             cache: (&cache_config).try_into()?,
             metadata_path: v.metadata_path.clone(),
@@ -2195,15 +2178,6 @@ mod tests {
         "#;
         let config = ConfigV2::from_str(content).unwrap();
         assert_eq!(&config.id, "");
-        // token refresh should be disabled when prefetch is enabled
-        assert!(
-            config
-                .get_backend_config()
-                .unwrap()
-                .get_registry_config()
-                .unwrap()
-                .disable_token_refresh
-        );
     }
 
     #[test]
@@ -2256,7 +2230,7 @@ mod tests {
             }
           }"#;
 
-        let mut rafs_config = ConfigV2::from_str(&config).unwrap();
+        let mut rafs_config = ConfigV2::from_str(config).unwrap();
         let test_auth = "test_auth".to_string();
 
         rafs_config.update_registry_auth_info(&Some(test_auth.clone()));
@@ -2646,6 +2620,261 @@ mod tests {
         assert_eq!(default_failure_limit(), 5);
         assert_eq!(default_prefetch_batch_size(), 1024 * 1024);
         assert_eq!(default_prefetch_threads_count(), 8);
+    }
+
+    #[test]
+    fn test_clone_without_secrets() {
+        let content = r#"version=2
+        [backend]
+        type = "oss"
+        [backend.oss]
+        endpoint = "my_endpoint"
+        bucket_name = "my_bucket"
+        access_key_id = "my_ak_id"
+        access_key_secret = "my_ak_secret"
+        [backend.registry]
+        host = "localhost"
+        repo = "nydus"
+        auth = "my_auth_token"
+        registry_token = "my_bearer_token"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        let clean = cfg.clone_without_secrets();
+
+        // Secrets must be erased.
+        let backend = clean.backend.as_ref().unwrap();
+        let oss = backend.oss.as_ref().unwrap();
+        assert!(oss.access_key_id.is_empty());
+        assert!(oss.access_key_secret.is_empty());
+        // Non-secret field must be preserved.
+        assert_eq!(&oss.endpoint, "my_endpoint");
+
+        let registry = backend.registry.as_ref().unwrap();
+        assert!(registry.auth.is_none());
+        assert!(registry.registry_token.is_none());
+        // Non-secret field must be preserved.
+        assert_eq!(&registry.host, "localhost");
+
+        // Original must be untouched.
+        let orig_backend = cfg.backend.as_ref().unwrap();
+        assert_eq!(
+            &orig_backend.oss.as_ref().unwrap().access_key_id,
+            "my_ak_id"
+        );
+    }
+
+    #[test]
+    fn test_clone_without_secrets_no_backend() {
+        let cfg = ConfigV2::new("id1");
+        // Should not panic even when backend is None.
+        let clean = cfg.clone_without_secrets();
+        assert!(clean.backend.is_none());
+    }
+
+    #[test]
+    fn test_is_chunk_validation_enabled() {
+        // Both absent → false.
+        let cfg = ConfigV2::new("id1");
+        assert!(!cfg.is_chunk_validation_enabled());
+
+        // Only cache.validate = true → true.
+        let content = r#"version=2
+        [cache]
+        type = "filecache"
+        validate = true
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(cfg.is_chunk_validation_enabled());
+
+        // Only rafs.validate = true → true.
+        let content = r#"version=2
+        [rafs]
+        validate = true
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(cfg.is_chunk_validation_enabled());
+
+        // Both false → false.
+        let content = r#"version=2
+        [cache]
+        type = "filecache"
+        validate = false
+        [rafs]
+        validate = false
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(!cfg.is_chunk_validation_enabled());
+    }
+
+    #[test]
+    fn test_is_fs_cache() {
+        // No cache → false.
+        let cfg = ConfigV2::new("id1");
+        assert!(!cfg.is_fs_cache());
+
+        // Cache with fscache sub-config → true.
+        let content = r#"version=2
+        [cache]
+        type = "fscache"
+        [cache.fscache]
+        work_dir = "/tmp"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(cfg.is_fs_cache());
+
+        // Cache with only filecache sub-config → false.
+        let content = r#"version=2
+        [cache]
+        type = "filecache"
+        [cache.filecache]
+        work_dir = "/tmp"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(!cfg.is_fs_cache());
+    }
+
+    #[test]
+    fn test_get_cache_working_directory_missing_sub_config() {
+        // filecache type but no [cache.filecache] section → error.
+        let content = r#"version=2
+        [cache]
+        type = "filecache"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(cfg.get_cache_working_directory().is_err());
+
+        // fscache type but no [cache.fscache] section → error.
+        let content = r#"version=2
+        [cache]
+        type = "fscache"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        assert!(cfg.get_cache_working_directory().is_err());
+    }
+
+    #[test]
+    fn test_backend_get_config_success_and_type_mismatch() {
+        // localdisk: success path and "wrong accessor" path.
+        let cfg = BackendConfigV2 {
+            backend_type: "localdisk".to_string(),
+            localdisk: Some(LocalDiskConfig {
+                device_path: "/dev/sda".to_string(),
+                disable_gpt: false,
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_localdisk_config().is_ok());
+        // Wrong accessor on localdisk config → wrong-type error.
+        assert!(cfg.get_localfs_config().is_err());
+
+        // localfs: success path.
+        let cfg = BackendConfigV2 {
+            backend_type: "localfs".to_string(),
+            localfs: Some(LocalFsConfig {
+                dir: "/tmp".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_localfs_config().is_ok());
+        assert!(cfg.get_oss_config().is_err());
+
+        // oss: success path.
+        let cfg = BackendConfigV2 {
+            backend_type: "oss".to_string(),
+            oss: Some(OssConfig {
+                endpoint: "ep".to_string(),
+                bucket_name: "bkt".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_oss_config().is_ok());
+        assert!(cfg.get_s3_config().is_err());
+
+        // s3: success path.
+        let cfg = BackendConfigV2 {
+            backend_type: "s3".to_string(),
+            s3: Some(S3Config {
+                region: "us-east-1".to_string(),
+                bucket_name: "bkt".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_s3_config().is_ok());
+        assert!(cfg.get_registry_config().is_err());
+
+        // registry: success path.
+        let cfg = BackendConfigV2 {
+            backend_type: "registry".to_string(),
+            registry: Some(RegistryConfig {
+                host: "localhost".to_string(),
+                repo: "nydus".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_registry_config().is_ok());
+        assert!(cfg.get_http_proxy_config().is_err());
+
+        // http-proxy: success path.
+        let cfg = BackendConfigV2 {
+            backend_type: "http-proxy".to_string(),
+            http_proxy: Some(HttpProxyConfig {
+                addr: "http://localhost:8080".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cfg.get_http_proxy_config().is_ok());
+        assert!(cfg.get_localdisk_config().is_err());
+    }
+
+    #[test]
+    fn test_backend_get_config_correct_type_missing_sub_config() {
+        // Correct type, but sub-config struct is None → InvalidData error.
+        let cfg = BackendConfigV2 {
+            backend_type: "localdisk".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_localdisk_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cfg = BackendConfigV2 {
+            backend_type: "localfs".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_localfs_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cfg = BackendConfigV2 {
+            backend_type: "oss".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_oss_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cfg = BackendConfigV2 {
+            backend_type: "s3".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_s3_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cfg = BackendConfigV2 {
+            backend_type: "registry".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_registry_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cfg = BackendConfigV2 {
+            backend_type: "http-proxy".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.get_http_proxy_config().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

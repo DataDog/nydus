@@ -26,17 +26,15 @@ tokio = { version = "1.24", features = ["macros"] }
 versionize_derive = "0.1.6"
 versionize = "0.2.0"
 
-nydus-api = { version = "0.4.0", path = "../api" }
-nydus-rafs = { version = "0.4.0", path = "../rafs" }
-nydus-storage = { version = "0.7.1", path = "../storage" }
+nydus-api = { version = "0.4.1", path = "../api" }
+nydus-rafs = { version = "0.4.1", path = "../rafs" }
+nydus-storage = { version = "0.7.2", path = "../storage" }
 nydus-upgrade = { version = "0.2.0", path = "../upgrade" }
-nydus-utils = { version = "0.5.0", path = "../utils" }
+nydus-utils = { version = "0.5.1", path = "../utils" }
 
 vhost = { workspace = true, features = ["vhost-user"], optional = true }
 vhost-user-backend = { workspace = true, optional = true }
-virtio-bindings = { workspace = true, features = [
-    "virtio-v5_0_0",
-], optional = true }
+virtio-bindings = { workspace = true, optional = true }
 virtio-queue = { workspace = true, optional = true }
 vm-memory = { workspace = true, features = ["backend-mmap"], optional = true }
 
@@ -47,7 +45,7 @@ tokio-uring = "0.4"
 vmm-sys-util = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-procfs = "0.17.0"
+procfs = "0.18.0"
 
 [features]
 default = ["fuse-backend-rs/fusedev"]

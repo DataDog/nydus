@@ -108,7 +108,7 @@ impl OptimizePrefetch {
             RafsBlobTable::V6(table) => table.get_all().len(),
         };
         let mut blob_state =
-            PrefetchBlobState::new(&ctx, blob_layer_num as u32, &output_blob_dir_path)?;
+            PrefetchBlobState::new(ctx, blob_layer_num as u32, &output_blob_dir_path)?;
         let mut batch = BatchContextGenerator::new(0)?;
         for node in prefetch_files.clone() {
             Self::process_prefetch_node(
@@ -146,7 +146,7 @@ impl OptimizePrefetch {
         // carefully address hardlink
         for node in prefetch_files.clone() {
             let file = &node.path;
-            if tree.get_node(&file).is_none() {
+            if tree.get_node(file).is_none() {
                 warn!(
                     "prefetch file {} is skipped, no need to fixing hardlink",
                     file.display()
@@ -155,7 +155,7 @@ impl OptimizePrefetch {
             }
 
             let tree_node = tree
-                .get_node(&file)
+                .get_node(file)
                 .ok_or(anyhow!("failed to get node"))?
                 .node
                 .as_ref();
@@ -182,7 +182,7 @@ impl OptimizePrefetch {
             RafsBlobTable::V6(table) => table.get_all(),
         };
         blob_mgr.extend_from_blob_table(ctx, blob_info)?;
-        let blob_table_withprefetch = blob_mgr.to_blob_table(&ctx)?;
+        let blob_table_withprefetch = blob_mgr.to_blob_table(ctx)?;
 
         bootstrap.dump(
             ctx,
@@ -210,10 +210,10 @@ impl OptimizePrefetch {
         let mut blob_mgr = BlobManager::new(ctx.digester, false);
         blob_mgr.add_blob(blob_state.blob_ctx.clone());
         blob_mgr.set_current_blob_index(0);
-        Blob::finalize_blob_data(&ctx, &mut blob_mgr, blob_state.blob_writer.as_mut())?;
+        Blob::finalize_blob_data(ctx, &mut blob_mgr, blob_state.blob_writer.as_mut())?;
         if let RafsBlobTable::V6(_) = blob_table {
             if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
-                Blob::dump_meta_data(&ctx, blob_ctx, blob_state.blob_writer.as_mut()).unwrap();
+                Blob::dump_meta_data(ctx, blob_ctx, blob_state.blob_writer.as_mut()).unwrap();
             };
         }
         ctx.blob_id = String::from("");
@@ -340,7 +340,7 @@ impl OptimizePrefetch {
                     (blob_info.meta_ci_uncompressed_size()
                         + size_of::<BlobChunkInfoV2Ondisk>() as u64) as usize,
                 );
-                blob_ctx.add_chunk_meta_info(&inner, Some(info))?;
+                blob_ctx.add_chunk_meta_info(inner, Some(info))?;
             }
             blob_ctx.compressed_blob_size += inner.compressed_size() as u64;
             blob_ctx.uncompressed_blob_size += aligned_d_size;
@@ -449,4 +449,248 @@ fn range_overlap(chunk: &mut NodeChunk, range: &PrefetchFileRange) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nydus_rafs::metadata::chunk::ChunkWrapper;
+    use std::io::Write;
+    use vmm_sys_util::tempfile::TempFile;
+
+    fn write_temp_json(content: &str) -> TempFile {
+        let f = TempFile::new().unwrap();
+        f.as_file().write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_empty_content() {
+        let f = write_temp_json("   \n  ");
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_unsupported_version() {
+        let f = write_temp_json(r#"{"version":"v2","files":[]}"#);
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_err());
+        let err_msg = match result {
+            Err(e) => format!("{}", e),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err_msg.contains("unsupported prefetch file version"));
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_invalid_json() {
+        let f = write_temp_json("this is not valid json");
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_v1_no_files() {
+        let f = write_temp_json(r#"{"version":"v1","files":[]}"#);
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_absolute_paths_included() {
+        let json = r#"{"version":"v1","files":[
+            {"path":"/usr/bin/ls","ranges":null},
+            {"path":"/usr/lib/libc.so","ranges":[[0,4096],[8192,4096]]}
+        ]}"#;
+        let f = write_temp_json(json);
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_ok());
+        let infos = result.unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].path, std::path::PathBuf::from("/usr/bin/ls"));
+        assert!(infos[0].ranges.is_none());
+        let ranges = infos[1].ranges.as_ref().unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].size, 4096);
+        assert_eq!(ranges[1].offset, 8192);
+        assert_eq!(ranges[1].size, 4096);
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_relative_paths_skipped() {
+        let json = r#"{"version":"v1","files":[
+            {"path":"relative/path/file","ranges":null},
+            {"path":"/absolute/path","ranges":null}
+        ]}"#;
+        let f = write_temp_json(json);
+        let result = generate_prefetch_file_info(f.as_path());
+        assert!(result.is_ok());
+        let infos = result.unwrap();
+        // Relative path should be skipped, only absolute path kept
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].path, std::path::PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_generate_prefetch_file_info_missing_file() {
+        let result =
+            generate_prefetch_file_info(std::path::Path::new("/nonexistent/path/file.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optimize_prefetch_struct_default() {
+        // OptimizePrefetch is a zero-sized struct
+        let _op = OptimizePrefetch {};
+        assert_eq!(std::mem::size_of::<OptimizePrefetch>(), 0);
+    }
+
+    #[test]
+    fn test_prefetch_file_info_clone() {
+        let json = r#"{"version":"v1","files":[{"path":"/bin/sh","ranges":[[0,512]]}]}"#;
+        let f = write_temp_json(json);
+        let infos = generate_prefetch_file_info(f.as_path()).unwrap();
+        assert_eq!(infos.len(), 1);
+        // PrefetchFileInfo implements Clone
+        let cloned = infos[0].clone();
+        assert_eq!(cloned.path, infos[0].path);
+    }
+
+    fn make_chunk(file_offset: u64, uncompressed_size: u32) -> NodeChunk {
+        let mut cw = ChunkWrapper::new(RafsVersion::V6);
+        cw.set_file_offset(file_offset);
+        cw.set_uncompressed_size(uncompressed_size);
+        NodeChunk {
+            source: ChunkSource::Build,
+            inner: Arc::new(cw),
+        }
+    }
+
+    #[test]
+    fn test_range_overlap_chunk_inside_range() {
+        // chunk [100, 150) is fully inside range [0, 500)
+        let mut chunk = make_chunk(100, 50);
+        let range = PrefetchFileRange {
+            offset: 0,
+            size: 500,
+        };
+        assert!(range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_range_overlap_range_inside_chunk() {
+        // range [200, 300) is fully inside chunk [0, 1000)
+        let mut chunk = make_chunk(0, 1000);
+        let range = PrefetchFileRange {
+            offset: 200,
+            size: 100,
+        };
+        assert!(range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_range_overlap_partial_overlap() {
+        // chunk [100, 200) overlaps with range [150, 350)
+        let mut chunk = make_chunk(100, 100);
+        let range = PrefetchFileRange {
+            offset: 150,
+            size: 200,
+        };
+        assert!(range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_range_overlap_touching_boundary_counts_as_overlap() {
+        // range ends exactly where chunk starts: range [100, 200), chunk [200, 300)
+        // max(100, 200) = 200 <= min(200, 300) = 200 → true
+        let mut chunk = make_chunk(200, 100);
+        let range = PrefetchFileRange {
+            offset: 100,
+            size: 100,
+        };
+        assert!(range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_range_overlap_no_overlap_range_before() {
+        // range [0, 100) is entirely before chunk [500, 600)
+        let mut chunk = make_chunk(500, 100);
+        let range = PrefetchFileRange {
+            offset: 0,
+            size: 100,
+        };
+        assert!(!range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_range_overlap_no_overlap_range_after() {
+        // range [500, 600) is entirely after chunk [0, 100)
+        let mut chunk = make_chunk(0, 100);
+        let range = PrefetchFileRange {
+            offset: 500,
+            size: 100,
+        };
+        assert!(!range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn test_rewrite_blob_id_matching_entry() {
+        let mut blob = BlobInfo::new(0, "old-id".to_string(), 0, 0, 0, 0, Default::default());
+        blob.set_blob_id("old-id".to_string());
+        let mut entries: Vec<Arc<BlobInfo>> = vec![Arc::new(blob)];
+        rewrite_blob_id(&mut entries, "old-id", "new-id".to_string());
+        assert_eq!(entries[0].blob_id(), "new-id");
+    }
+
+    #[test]
+    fn test_rewrite_blob_id_no_match() {
+        let mut blob = BlobInfo::new(0, "other-id".to_string(), 0, 0, 0, 0, Default::default());
+        blob.set_blob_id("other-id".to_string());
+        let mut entries: Vec<Arc<BlobInfo>> = vec![Arc::new(blob)];
+        rewrite_blob_id(&mut entries, "old-id", "new-id".to_string());
+        // Should not modify entries that don't match.
+        assert_eq!(entries[0].blob_id(), "other-id");
+    }
+
+    #[test]
+    fn test_rewrite_blob_id_multiple_entries() {
+        let blobs: Vec<Arc<BlobInfo>> = vec![
+            Arc::new(BlobInfo::new(
+                0,
+                "target".to_string(),
+                0,
+                0,
+                0,
+                0,
+                Default::default(),
+            )),
+            Arc::new(BlobInfo::new(
+                1,
+                "other".to_string(),
+                0,
+                0,
+                0,
+                0,
+                Default::default(),
+            )),
+            Arc::new(BlobInfo::new(
+                2,
+                "target".to_string(),
+                0,
+                0,
+                0,
+                0,
+                Default::default(),
+            )),
+        ];
+        let mut entries = blobs;
+        rewrite_blob_id(&mut entries, "target", "replaced".to_string());
+        assert_eq!(entries[0].blob_id(), "replaced");
+        assert_eq!(entries[1].blob_id(), "other");
+        assert_eq!(entries[2].blob_id(), "replaced");
+    }
 }

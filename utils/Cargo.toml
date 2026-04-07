@@ -1,6 +1,6 @@
 [package]
 name = "nydus-utils"
-version = "0.5.0"
+version = "0.5.1"
 description = "Utilities and helpers for Nydus Image Service"
 authors = ["The Nydus Developers"]
 license = "Apache-2.0 OR BSD-3-Clause"
@@ -25,15 +25,16 @@ sha2 = "0.10.0"
 tokio = { version = "1.19.0", features = ["rt", "sync"] }
 zstd = "0.11"
 nix = "0.24"
-crc = "3.2.1"
+crc = "3.4.0"
 
-nydus-api = { version = "0.4.0", path = "../api" }
+nydus-api = { version = "0.4.1", path = "../api" }
 
-# libz-ng-sys doesn't compile on ppc64. Have to fallback to stock zlib-sys
-[target.'cfg(target_arch = "powerpc64")'.dependencies]
+# libz-ng-sys doesn't compile on ppc64, and zlib-ng currently breaks test binary
+# linking on linux/aarch64 in this workspace. Fall back to stock zlib-sys there.
+[target.'cfg(any(target_arch = "powerpc64", all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 libz-sys = { version = "1.1.12", features = ["stock-zlib"], default-features = false, optional = true }
 flate2 = { version = "1.0.28", features = ["zlib"], default-features = false }
-[target.'cfg(not(target_arch = "powerpc64"))'.dependencies]
+[target.'cfg(not(any(target_arch = "powerpc64", all(target_os = "linux", target_arch = "aarch64"))))'.dependencies]
 libz-sys = { version = "1.1.8", features = ["zlib-ng"], default-features = false, optional = true }
 flate2 = { version = "1.0.28", features = ["zlib-ng-compat"], default-features = false }
 
