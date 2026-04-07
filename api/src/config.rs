@@ -638,9 +638,6 @@ pub struct RegistryConfig {
     /// Disable background token refresh thread. Defaults to false.
     #[serde(skip_deserializing)]
     pub disable_token_refresh: bool,
-    /// Prevent automatic fallback from HTTPS to HTTP on TLS errors.
-    #[serde(default)]
-    pub skip_http_fallback: bool,
     /// Enable mirrors for the read request.
     #[serde(default)]
     pub mirrors: Vec<MirrorConfig>,
