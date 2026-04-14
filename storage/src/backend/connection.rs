@@ -74,6 +74,12 @@ pub(crate) struct ConnectionConfig {
     pub timeout: u32,
     pub connect_timeout: u32,
     pub retry_limit: u8,
+    /// Paths to PEM-encoded CA certificate files to trust in addition to the system CA store.
+    pub ca_cert_files: Vec<String>,
+    /// Path to a PEM-encoded client certificate file for mTLS authentication.
+    pub client_cert_file: Option<String>,
+    /// Path to a PEM-encoded private key file for mTLS authentication.
+    pub client_key_file: Option<String>,
 }
 
 impl Default for ConnectionConfig {
@@ -85,6 +91,9 @@ impl Default for ConnectionConfig {
             timeout: 5,
             connect_timeout: 5,
             retry_limit: 0,
+            ca_cert_files: Vec::new(),
+            client_cert_file: None,
+            client_key_file: None,
         }
     }
 }
@@ -98,6 +107,9 @@ impl From<OssConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
+            client_cert_file: None,
+            client_key_file: None,
         }
     }
 }
@@ -111,6 +123,9 @@ impl From<S3Config> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
+            client_cert_file: None,
+            client_key_file: None,
         }
     }
 }
@@ -124,6 +139,9 @@ impl From<RegistryConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
+            client_cert_file: c.client_cert_file,
+            client_key_file: c.client_key_file,
         }
     }
 }
@@ -137,6 +155,9 @@ impl From<HttpProxyConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: Vec::new(),
+            client_cert_file: None,
+            client_key_file: None,
         }
     }
 }
@@ -658,6 +679,22 @@ impl Connection {
 
         if config.skip_verify {
             cb = cb.danger_accept_invalid_certs(true);
+        }
+
+        for ca_cert_file in &config.ca_cert_files {
+            let pem = std::fs::read(ca_cert_file).map_err(|e| einval!(e))?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| einval!(e))?;
+            cb = cb.add_root_certificate(cert);
+        }
+
+        if let (Some(cert_file), Some(key_file)) =
+            (&config.client_cert_file, &config.client_key_file)
+        {
+            let cert_pem = std::fs::read(cert_file).map_err(|e| einval!(e))?;
+            let key_pem = std::fs::read(key_file).map_err(|e| einval!(e))?;
+            let identity = reqwest::Identity::from_pkcs8_pem(&cert_pem, &key_pem)
+                .map_err(|e| einval!(e))?;
+            cb = cb.identity(identity);
         }
 
         if !proxy.is_empty() {
