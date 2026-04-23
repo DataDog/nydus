@@ -2,6 +2,8 @@ module github.com/dragonflyoss/nydus/smoke
 
 go 1.24.3
 
+toolchain go1.26.2
+
 require (
 	github.com/BraveY/snapshotter-converter v0.0.6
 	github.com/containerd/containerd v1.7.27
