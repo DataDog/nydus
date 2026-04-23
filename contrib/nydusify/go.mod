@@ -2,6 +2,8 @@ module github.com/dragonflyoss/nydus/contrib/nydusify
 
 go 1.24.3
 
+toolchain go1.26.2
+
 require (
 	github.com/BraveY/snapshotter-converter v0.0.5
 	github.com/CloudNativeAI/model-spec v0.0.2
