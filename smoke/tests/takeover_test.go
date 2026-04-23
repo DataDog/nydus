@@ -18,7 +18,7 @@ import (
 	"github.com/dragonflyoss/nydus/smoke/tests/tool"
 	"github.com/dragonflyoss/nydus/smoke/tests/tool/test"
 	"github.com/google/uuid"
-	"github.com/pelletier/go-toml"
+	"github.com/pelletier/go-toml/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
