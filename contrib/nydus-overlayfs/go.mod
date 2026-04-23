@@ -2,6 +2,8 @@ module github.com/dragonflyoss/nydus/contrib/nydus-overlayfs
 
 go 1.24.3
 
+toolchain go1.26.2
+
 require (
 	github.com/pkg/errors v0.9.1
 	github.com/urfave/cli/v2 v2.27.1
