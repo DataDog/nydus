@@ -14,7 +14,7 @@ import (
 	"reflect"
 	"syscall"
 
-	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
+	modelspec "github.com/modelpack/model-spec/specs-go/v1"
 	"github.com/distribution/reference"
 
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/checker/tool"

@@ -18,7 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
-	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
+	modelspec "github.com/modelpack/model-spec/specs-go/v1"
 	pkgPvd "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )

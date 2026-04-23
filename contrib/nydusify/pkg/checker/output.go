@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
+	modelspec "github.com/modelpack/model-spec/specs-go/v1"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
