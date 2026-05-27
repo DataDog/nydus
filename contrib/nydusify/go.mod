@@ -1,8 +1,6 @@
 module github.com/dragonflyoss/nydus/contrib/nydusify
 
-go 1.23.1
-
-toolchain go1.23.6
+go 1.24.0
 
 require (
 	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible

@@ -59,6 +59,7 @@ jobs:
         arch: [amd64, arm64]
     env:
       DOCKER: false
+      GOFIPS140: v1.0.0
     steps:
     - uses: actions/checkout@v4
     - name: Setup Golang
@@ -71,6 +72,13 @@ jobs:
         make -e GOARCH=${{ matrix.arch }} contrib-release
         sudo mv contrib/nydusify/cmd/nydusify .
         sudo mv contrib/nydus-overlayfs/bin/nydus-overlayfs .
+    - name: verify FIPS build info
+      run: |
+        for bin in nydusify nydus-overlayfs; do
+          echo "Checking $bin"
+          go version -m "$bin" | grep -q 'GOFIPS140=v1.0.0' \
+            || { echo "ERROR: $bin not built with GOFIPS140=v1.0.0"; exit 1; }
+        done
     - name: store-artifacts
       uses: actions/upload-artifact@v4
       with:
