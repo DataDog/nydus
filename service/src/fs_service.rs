@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, MutexGuard};
 
+use fuse_backend_rs::abi::fuse_abi::ROOT_ID;
 #[cfg(target_os = "linux")]
 use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions, Layer};
 use fuse_backend_rs::api::vfs::VfsError;
@@ -23,6 +24,7 @@ use fuse_backend_rs::overlayfs::{config::Config as overlay_config, OverlayFs};
 use fuse_backend_rs::passthrough::{CachePolicy, Config as passthrough_config, PassthroughFs};
 use nydus_api::ConfigV2;
 use nydus_rafs::fs::Rafs;
+use nydus_rafs::metadata::RafsInode;
 use nydus_rafs::{RafsError, RafsIoRead};
 use nydus_storage::factory::BLOB_FACTORY;
 use serde::{Deserialize, Serialize};
@@ -86,7 +88,7 @@ impl FsBackendCollection {
         Ok(())
     }
 
-    fn del(&mut self, id: &str) {
+    pub fn del(&mut self, id: &str) {
         self.0.remove(id);
     }
 }
@@ -99,12 +101,12 @@ pub trait FsService: Send + Sync {
 
     /// Get the [BackFileSystem](https://docs.rs/fuse-backend-rs/latest/fuse_backend_rs/api/vfs/type.BackFileSystem.html)
     /// object associated with a mount point.
-    fn backend_from_mountpoint(&self, mp: &str) -> Result<Option<Arc<BackFileSystem>>> {
+    fn backend_from_mountpoint(&self, mp: &str) -> Result<Option<(Arc<BackFileSystem>, u8)>> {
         self.get_vfs().get_rootfs(mp).map_err(|e| e.into())
     }
 
     /// Get handle to the optional upgrade manager.
-    fn upgrade_mgr(&self) -> Option<MutexGuard<UpgradeManager>>;
+    fn upgrade_mgr(&self) -> Option<MutexGuard<'_, UpgradeManager>>;
 
     /// Mount a new filesystem instance.
     // NOTE: This method is not thread-safe, however, it is acceptable as
@@ -133,7 +135,7 @@ pub trait FsService: Send + Sync {
 
     /// Remount a filesystem instance.
     fn remount(&self, cmd: FsBackendMountCmd) -> Result<()> {
-        let rootfs = self
+        let (rootfs, _) = self
             .backend_from_mountpoint(&cmd.mountpoint)?
             .ok_or(Error::NotFound)?;
         let mut bootstrap = <dyn RafsIoRead>::from_file(&cmd.source)?;
@@ -144,7 +146,7 @@ pub trait FsService: Send + Sync {
         let rafs_cfg = ConfigV2::from_str(&cmd.config).map_err(RafsError::LoadConfig)?;
         let rafs_cfg = Arc::new(rafs_cfg);
 
-        rafs.update(&mut bootstrap, &rafs_cfg)
+        rafs.update(&mut bootstrap, &rafs_cfg, &cmd.mountpoint)
             .map_err(|e| match e {
                 RafsError::Unsupported => Error::Unsupported,
                 e => Error::Rafs(e),
@@ -171,16 +173,30 @@ pub trait FsService: Send + Sync {
         self.get_vfs()
             .restore_mount(backend, vfs_index, &cmd.mountpoint)
             .map_err(VfsError::RestoreMount)?;
-        self.backend_collection().add(&cmd.mountpoint, &cmd)?;
+        self.backend_collection().add(&cmd.mountpoint, cmd)?;
         info!("backend fs restored at {}", cmd.mountpoint);
         Ok(())
     }
 
     /// Umount a filesystem instance.
     fn umount(&self, cmd: FsBackendUmountCmd) -> Result<()> {
-        let _ = self
+        let (fs, fs_idx) = self
             .backend_from_mountpoint(&cmd.mountpoint)?
             .ok_or(Error::NotFound)?;
+
+        if self.is_fuse() {
+            if let Some(rafs) = fs.deref().as_any().downcast_ref::<Rafs>() {
+                let root_ino = rafs.get_root_inode().unwrap();
+                self.walk_and_notify_invalidation(
+                    ROOT_ID,
+                    cmd.mountpoint.trim_start_matches('/'),
+                    root_ino,
+                    fs_idx,
+                )?;
+            }
+        }
+
+        drop(fs);
 
         self.get_vfs().umount(&cmd.mountpoint)?;
         self.backend_collection().del(&cmd.mountpoint);
@@ -197,11 +213,11 @@ pub trait FsService: Send + Sync {
     }
 
     /// Get list of metrics information objects about mounted filesystem instances.
-    fn backend_collection(&self) -> MutexGuard<FsBackendCollection>;
+    fn backend_collection(&self) -> MutexGuard<'_, FsBackendCollection>;
 
     /// Export information about the filesystem service.
     fn export_backend_info(&self, mountpoint: &str) -> Result<String> {
-        let fs = self
+        let (fs, _) = self
             .backend_from_mountpoint(mountpoint)?
             .ok_or(Error::NotFound)?;
         let any_fs = fs.deref().as_any();
@@ -215,6 +231,21 @@ pub trait FsService: Send + Sync {
     /// Export metrics about in-flight operations.
     fn export_inflight_ops(&self) -> Result<Option<String>>;
 
+    /// Recursively walk the inode tree and send cache invalidation notifications.
+    fn walk_and_notify_invalidation(
+        &self,
+        _parent_kernel_ino: u64,
+        _cur_name: &str,
+        _cur_inode: Arc<dyn RafsInode>,
+        _fs_idx: u8,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether the filesystem service is a FUSE service.
+    fn is_fuse(&self) -> bool {
+        false
+    }
     /// Cast `self` to trait object of [Any] to support object downcast.
     fn as_any(&self) -> &dyn Any;
 }
@@ -396,10 +427,40 @@ mod tests {
         assert!(files.is_ok(), "failed to verify prefetch files");
         assert_eq!(1, files.unwrap().unwrap().len());
 
+        let files = validate_prefetch_file_list(&None).unwrap();
+        assert!(files.is_none());
+
         assert!(
             validate_prefetch_file_list(&Some(vec!["etc/passwd".to_string()])).is_err(),
             "should not pass verify"
         );
+
+        assert!(validate_prefetch_file_list(&Some(vec![
+            "/etc/passwd".to_string(),
+            "relative/path".to_string(),
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn it_should_add_passthrough_backend_and_override() {
+        let mut col: FsBackendCollection = Default::default();
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::PassthroughFs,
+            config: String::new(),
+            mountpoint: "/tmp/mount".to_string(),
+            source: "/tmp/source".to_string(),
+            prefetch_files: None,
+        };
+        assert!(col.add("test", &cmd).is_ok());
+        assert_eq!(col.0.len(), 1);
+        assert!(col.0.get("test").unwrap().config.is_none());
+
+        assert!(col.add("test", &cmd).is_ok());
+        assert_eq!(col.0.len(), 1);
+
+        col.del("missing");
+        assert_eq!(col.0.len(), 1);
     }
 
     #[test]

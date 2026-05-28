@@ -69,6 +69,7 @@ pub struct Rafs {
     prefetch_all: bool,
     xattr_enabled: bool,
     user_io_batch_size: u32,
+    prefetch_batch_size: u64,
 
     // static inode attributes
     i_uid: u32,
@@ -78,31 +79,37 @@ pub struct Rafs {
 
 impl Rafs {
     /// Create a new instance of `Rafs`.
-    pub fn new(cfg: &Arc<ConfigV2>, id: &str, path: &Path) -> RafsResult<(Self, RafsIoReader)> {
+    pub fn new(
+        cfg: &Arc<ConfigV2>,
+        mountpoint: &str,
+        metadata_path: &Path,
+    ) -> RafsResult<(Self, RafsIoReader)> {
         // Assume all meta/data blobs are accessible, otherwise it will always cause IO errors.
         cfg.internal.set_blob_accessible(true);
 
         let cache_cfg = cfg.get_cache_config().map_err(RafsError::LoadConfig)?;
         let rafs_cfg = cfg.get_rafs_config().map_err(RafsError::LoadConfig)?;
-        let (sb, reader) = RafsSuper::load_from_file(path, cfg.clone(), false)
+        let (sb, reader) = RafsSuper::load_from_file(metadata_path, cfg.clone(), false)
             .map_err(RafsError::FillSuperBlock)?;
         let blob_infos = sb.superblock.get_blob_infos();
-        let device = BlobDevice::new(cfg, &blob_infos).map_err(RafsError::CreateDevice)?;
+        let device =
+            BlobDevice::new(cfg, &blob_infos, mountpoint).map_err(RafsError::CreateDevice)?;
 
         if cfg.is_chunk_validation_enabled() && sb.meta.has_inlined_chunk_digest() {
             sb.superblock.set_blob_device(device.clone());
         }
 
         let rafs = Rafs {
-            id: id.to_string(),
+            id: mountpoint.to_string(),
             device,
-            ios: metrics::FsIoStats::new(id),
+            ios: metrics::FsIoStats::new(mountpoint),
             sb: Arc::new(sb),
 
             initialized: false,
             digest_validate: rafs_cfg.validate,
             fs_prefetch: rafs_cfg.prefetch.enable,
             user_io_batch_size: rafs_cfg.user_io_batch_size as u32,
+            prefetch_batch_size: rafs_cfg.prefetch.batch_size as u64,
             prefetch_all: rafs_cfg.prefetch.prefetch_all,
             xattr_enabled: rafs_cfg.enable_xattr,
 
@@ -138,7 +145,12 @@ impl Rafs {
     }
 
     /// Update storage backend for blobs.
-    pub fn update(&self, r: &mut RafsIoReader, conf: &Arc<ConfigV2>) -> RafsResult<()> {
+    pub fn update(
+        &self,
+        r: &mut RafsIoReader,
+        conf: &Arc<ConfigV2>,
+        mountpoint: &str,
+    ) -> RafsResult<()> {
         info!("update");
         if !self.initialized {
             warn!("Rafs is not yet initialized");
@@ -157,7 +169,7 @@ impl Rafs {
         // step 2: update device (only localfs is supported)
         let blob_infos = self.sb.superblock.get_blob_infos();
         self.device
-            .update(conf, &blob_infos, self.fs_prefetch)
+            .update(conf, &blob_infos, self.fs_prefetch, mountpoint)
             .map_err(RafsError::SwapBackend)?;
         info!("update device is successful");
 
@@ -333,9 +345,18 @@ impl Rafs {
         let device = self.device.clone();
         let prefetch_all = self.prefetch_all;
         let root_ino = self.root_ino();
+        let prefetch_batch_size = self.prefetch_batch_size;
 
         let _ = std::thread::spawn(move || {
-            Self::do_prefetch(root_ino, reader, prefetch_files, prefetch_all, sb, device);
+            Self::do_prefetch(
+                root_ino,
+                reader,
+                prefetch_files,
+                prefetch_all,
+                prefetch_batch_size,
+                sb,
+                device,
+            );
         });
     }
 
@@ -348,11 +369,17 @@ impl Rafs {
         self.sb.superblock.root_ino()
     }
 
+    pub fn get_root_inode(&self) -> Result<Arc<dyn RafsInode>> {
+        let root_ino = self.root_ino();
+        self.sb.get_inode(root_ino, self.digest_validate)
+    }
+
     fn do_prefetch(
         root_ino: u64,
         mut reader: RafsIoReader,
         prefetch_files: Option<Vec<PathBuf>>,
         prefetch_all: bool,
+        prefetch_batch_size: u64,
         sb: Arc<RafsSuper>,
         device: BlobDevice,
     ) {
@@ -385,10 +412,7 @@ impl Rafs {
         }
 
         let fetcher = |desc: &mut BlobIoVec, last: bool| {
-            if desc.size() as u64 > RAFS_MAX_CHUNK_SIZE
-                || desc.len() > 1024
-                || (last && desc.size() > 0)
-            {
+            if desc.size() > RAFS_MAX_CHUNK_SIZE || desc.len() > 1024 || (last && desc.size() > 0) {
                 trace!(
                     "fs prefetch: 0x{:x} bytes for {} descriptors",
                     desc.size(),
@@ -438,12 +462,9 @@ impl Rafs {
         // chunk based full prefetch
         if !ignore_prefetch_all && (inlay_prefetch_all || prefetch_all || startup_prefetch_all) {
             if sb.meta.is_v6() {
-                // The larger batch size, the fewer requests to registry
-                let batch_size = 1024 * 1024 * 2;
-
                 for blob in &blob_infos {
                     let blob_size = blob.compressed_data_size();
-                    let count = div_round_up(blob_size, batch_size);
+                    let count = div_round_up(blob_size, prefetch_batch_size);
 
                     let mut pre_offset = 0u64;
 
@@ -451,13 +472,13 @@ impl Rafs {
                         let req = BlobPrefetchRequest {
                             blob_id: blob.blob_id().to_owned(),
                             offset: pre_offset,
-                            len: cmp::min(batch_size, blob_size - pre_offset),
+                            len: cmp::min(prefetch_batch_size, blob_size - pre_offset),
                         };
                         device
                             .prefetch(&[], &[req])
                             .map_err(|e| warn!("failed to prefetch blob data, {}", e))
                             .unwrap_or_default();
-                        pre_offset += batch_size;
+                        pre_offset += prefetch_batch_size;
                         if pre_offset > blob_size {
                             break;
                         }
@@ -1043,6 +1064,7 @@ mod tests {
             prefetch_all: false,
             xattr_enabled: false,
             user_io_batch_size: 0,
+            prefetch_batch_size: 0,
             i_uid: 0,
             i_gid: 0,
             i_time: 0,
@@ -1069,5 +1091,96 @@ mod tests {
         .unwrap();
         rafs.statfs(&Context::default(), Inode::default()).unwrap();
         rafs.destroy();
+    }
+
+    fn make_test_rafs() -> Rafs {
+        use nydus_utils::metrics::FsIoStats;
+        Rafs {
+            id: "test-id".into(),
+            device: BlobDevice::default(),
+            ios: FsIoStats::default().into(),
+            sb: Arc::new(RafsSuper::default()),
+            initialized: false,
+            digest_validate: false,
+            fs_prefetch: false,
+            prefetch_all: false,
+            xattr_enabled: true,
+            user_io_batch_size: 64,
+            prefetch_batch_size: 128,
+            i_uid: 1000,
+            i_gid: 1000,
+            i_time: 12345678,
+        }
+    }
+
+    #[test]
+    fn test_rafs_metadata_accessible() {
+        let rafs = make_test_rafs();
+        // metadata() should return a valid RafsSuperMeta reference
+        let meta = rafs.metadata();
+        // Default superblock should have default meta values
+        assert_eq!(meta.magic, 0);
+    }
+
+    #[test]
+    fn test_rafs_xattr_supported() {
+        let rafs = make_test_rafs();
+        // We set xattr_enabled = true
+        assert!(rafs.xattr_supported());
+    }
+
+    #[test]
+    fn test_rafs_forget_noop() {
+        let rafs = make_test_rafs();
+        // forget is a no-op, just verify it doesn't panic
+        rafs.forget(&Context::default(), Inode::default(), 1);
+    }
+
+    #[test]
+    fn test_rafs_batch_forget_noop() {
+        let rafs = make_test_rafs();
+        // batch_forget is also a no-op
+        rafs.batch_forget(&Context::default(), vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn test_rafs_negative_entry_timeouts() {
+        let rafs = make_test_rafs();
+        let ent = rafs.negative_entry();
+        assert_eq!(ent.inode, 0);
+        assert_eq!(ent.generation, 0);
+        // attr_timeout and entry_timeout come from sb.meta (default = 0)
+        assert_eq!(ent.attr_timeout, rafs.sb.meta.attr_timeout);
+        assert_eq!(ent.entry_timeout, rafs.sb.meta.entry_timeout);
+    }
+
+    #[test]
+    fn test_rafs_id_reflects_constructor_value() {
+        use nydus_utils::metrics::FsIoStats;
+        let rafs = Rafs {
+            id: "my-rafs-instance".into(),
+            device: BlobDevice::default(),
+            ios: FsIoStats::default().into(),
+            sb: Arc::new(RafsSuper::default()),
+            initialized: false,
+            digest_validate: false,
+            fs_prefetch: false,
+            prefetch_all: false,
+            xattr_enabled: false,
+            user_io_batch_size: 0,
+            prefetch_batch_size: 0,
+            i_uid: 0,
+            i_gid: 0,
+            i_time: 0,
+        };
+        assert_eq!(rafs.id(), "my-rafs-instance");
+    }
+
+    #[test]
+    fn test_convert_file_list_empty() {
+        let rafs = make_test_rafs();
+        let files: Vec<PathBuf> = vec![];
+        let result = Rafs::convert_file_list(&files, &rafs.sb);
+        assert!(result.is_empty());
     }
 }

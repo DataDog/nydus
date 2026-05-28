@@ -302,11 +302,9 @@ impl Node {
             external_blob_ctx.blob_id = external_blob_id.to_string();
             external_blob_ctx.compressed_blob_size = external_compressed_size;
             external_blob_ctx.uncompressed_blob_size = external_compressed_size;
-            let chunk_count = self
-                .chunk_count(external_chunk_size as u64)
-                .with_context(|| {
-                    format!("failed to get chunk count for {}", self.path().display())
-                })?;
+            let chunk_count = self.chunk_count(external_chunk_size).with_context(|| {
+                format!("failed to get chunk count for {}", self.path().display())
+            })?;
             self.inode.set_child_count(chunk_count);
 
             info!(
@@ -320,7 +318,7 @@ impl Node {
             );
             for i in 0..self.inode.child_count() {
                 let mut chunk = self.inode.create_chunk();
-                let file_offset = i as u64 * external_chunk_size as u64;
+                let file_offset = i as u64 * external_chunk_size;
                 let compressed_size = if i == self.inode.child_count() - 1 {
                     self.inode.size() - (external_chunk_size * i as u64)
                 } else {
@@ -536,41 +534,44 @@ impl Node {
         let encrypted = blob_ctx.blob_cipher != crypt::Algorithm::None;
         let mut dumped_size = None;
 
-        if ctx.blob_batch_generator.is_some()
-            && self.inode.child_count() == 1
-            && d_size < ctx.batch_size / 2
-        {
-            // This chunk will be added into a batch chunk.
-            let mut batch = ctx.blob_batch_generator.as_ref().unwrap().lock().unwrap();
+        if let Some(batch_gen) = ctx.blob_batch_generator.as_ref() {
+            if self.inode.child_count() == 1 && d_size < ctx.batch_size / 2 {
+                // This chunk will be added into a batch chunk.
+                let mut batch = batch_gen.lock().unwrap();
 
-            if batch.chunk_data_buf_len() as u32 + d_size < ctx.batch_size {
-                // Add into current batch chunk directly.
-                chunk_info = Some(batch.generate_chunk_info(
-                    blob_ctx.current_compressed_offset,
-                    pre_d_offset,
-                    d_size,
-                    encrypted,
-                )?);
-                batch.append_chunk_data_buf(chunk_data);
-            } else {
-                // Dump current batch chunk if exists, and then add into a new batch chunk.
-                if !batch.chunk_data_buf_is_empty() {
-                    // Dump current batch chunk.
-                    let (_, c_size, _) =
-                        Self::write_chunk_data(ctx, blob_ctx, blob_writer, batch.chunk_data_buf())?;
-                    dumped_size = Some(c_size);
-                    batch.add_context(c_size);
-                    batch.clear_chunk_data_buf();
+                if batch.chunk_data_buf_len() as u32 + d_size < ctx.batch_size {
+                    // Add into current batch chunk directly.
+                    chunk_info = Some(batch.generate_chunk_info(
+                        blob_ctx.current_compressed_offset,
+                        pre_d_offset,
+                        d_size,
+                        encrypted,
+                    )?);
+                    batch.append_chunk_data_buf(chunk_data);
+                } else {
+                    // Dump current batch chunk if exists, and then add into a new batch chunk.
+                    if !batch.chunk_data_buf_is_empty() {
+                        // Dump current batch chunk.
+                        let (_, c_size, _) = Self::write_chunk_data(
+                            ctx,
+                            blob_ctx,
+                            blob_writer,
+                            batch.chunk_data_buf(),
+                        )?;
+                        dumped_size = Some(c_size);
+                        batch.add_context(c_size);
+                        batch.clear_chunk_data_buf();
+                    }
+
+                    // Add into a new batch chunk.
+                    chunk_info = Some(batch.generate_chunk_info(
+                        blob_ctx.current_compressed_offset,
+                        pre_d_offset,
+                        d_size,
+                        encrypted,
+                    )?);
+                    batch.append_chunk_data_buf(chunk_data);
                 }
-
-                // Add into a new batch chunk.
-                chunk_info = Some(batch.generate_chunk_info(
-                    blob_ctx.current_compressed_offset,
-                    pre_d_offset,
-                    d_size,
-                    encrypted,
-                )?);
-                batch.append_chunk_data_buf(chunk_data);
             }
         } else if !ctx.blob_features.contains(BlobFeatures::SEPARATE) {
             // For other case which needs to write chunk data to data blobs. Which means,
@@ -1118,25 +1119,25 @@ mod tests {
 
         let mut chunk_data_buf = [1u8; 32];
 
-        node.inode.set_mode(0o755 | libc::S_IFDIR as u32);
+        node.inode.set_mode(0o755 | crate::mode_bits(libc::S_IFDIR));
         let data_size =
             node.dump_node_data(&ctx, &mut blob_mgr, &mut blob_writer, &mut chunk_data_buf);
         assert!(data_size.is_ok());
         assert_eq!(data_size.unwrap(), 0);
 
-        node.inode.set_mode(0o755 | libc::S_IFLNK as u32);
+        node.inode.set_mode(0o755 | crate::mode_bits(libc::S_IFLNK));
         let data_size =
             node.dump_node_data(&ctx, &mut blob_mgr, &mut blob_writer, &mut chunk_data_buf);
         assert!(data_size.is_ok());
         assert_eq!(data_size.unwrap(), 0);
 
-        node.inode.set_mode(0o755 | libc::S_IFBLK as u32);
+        node.inode.set_mode(0o755 | crate::mode_bits(libc::S_IFBLK));
         let data_size =
             node.dump_node_data(&ctx, &mut blob_mgr, &mut blob_writer, &mut chunk_data_buf);
         assert!(data_size.is_ok());
         assert_eq!(data_size.unwrap(), 0);
 
-        node.inode.set_mode(0o755 | libc::S_IFREG as u32);
+        node.inode.set_mode(0o755 | crate::mode_bits(libc::S_IFREG));
         let data_size =
             node.dump_node_data(&ctx, &mut blob_mgr, &mut blob_writer, &mut chunk_data_buf);
         assert!(data_size.is_ok());
@@ -1162,26 +1163,26 @@ mod tests {
 
         let mut inode1 = inode.clone();
         inode1.set_size(1 << 60);
-        inode1.set_mode(0o755 | libc::S_IFREG as u32);
+        inode1.set_mode(0o755 | crate::mode_bits(libc::S_IFREG));
         let node = Node::new(inode1, info.clone(), 1);
         assert!(node.chunk_count(2).is_err());
 
         let mut inode2 = inode.clone();
-        inode2.set_mode(0o755 | libc::S_IFCHR as u32);
+        inode2.set_mode(0o755 | crate::mode_bits(libc::S_IFCHR));
         let node = Node::new(inode2, info.clone(), 1);
         assert!(node.chunk_count(2).is_ok());
         assert_eq!(node.chunk_count(2).unwrap(), 0);
 
         let mut inode3 = inode.clone();
-        inode3.set_mode(0o755 | libc::S_IFLNK as u32);
+        inode3.set_mode(0o755 | crate::mode_bits(libc::S_IFLNK));
         let node = Node::new(inode3, info.clone(), 1);
         assert_eq!(node.file_type(), "symlink");
         let mut inode4 = inode.clone();
-        inode4.set_mode(0o755 | libc::S_IFDIR as u32);
+        inode4.set_mode(0o755 | crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode4, info.clone(), 1);
         assert_eq!(node.file_type(), "dir");
         let mut inode5 = inode.clone();
-        inode5.set_mode(0o755 | libc::S_IFREG as u32);
+        inode5.set_mode(0o755 | crate::mode_bits(libc::S_IFREG));
         let node = Node::new(inode5, info.clone(), 1);
         assert_eq!(node.file_type(), "file");
 

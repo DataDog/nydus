@@ -95,7 +95,7 @@ impl<T> Channel<T> {
     }
 
     /// Lock the channel to block all queue operations.
-    pub fn lock_channel(&self) -> MutexGuard<VecDeque<T>> {
+    pub fn lock_channel(&self) -> MutexGuard<'_, VecDeque<T>> {
         self.requests.lock().unwrap()
     }
 
@@ -168,5 +168,33 @@ mod tests {
 
         channel.close();
         channel.send(2u32).unwrap_err();
+    }
+
+    #[test]
+    fn test_flush_keeps_matching() {
+        let channel = Channel::new();
+        channel.send(1u32).unwrap();
+        channel.send(2u32).unwrap();
+        channel.send(3u32).unwrap();
+        // Flush odd numbers, keep even numbers
+        channel.flush_pending_prefetch_requests(|&t| t % 2 == 1);
+        assert_eq!(channel.try_recv().unwrap(), 2);
+        assert!(channel.try_recv().is_none());
+    }
+
+    #[test]
+    fn test_recv_closed_channel_returns_broken_pipe() {
+        let channel = Arc::new(Channel::<u32>::new());
+        channel.close();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let result = channel.recv().await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        });
     }
 }

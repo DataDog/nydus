@@ -13,13 +13,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  has:
+    runs-on: ubuntu-slim
+    outputs:
+      latest-16: ${{ env.HAS_LATEST_16 }}
+    env:
+      HAS_LATEST_16: ${{ (github.repository_owner == 'dragonflyoss' || vars.HAS_LATEST_16) && '1' || '' }}
+    steps:
+      - run: |
+          true
   nydus-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
     strategy:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Cache cargo
       uses: Swatinem/rust-cache@v2
       with:
@@ -72,7 +81,7 @@ jobs:
         sudo cp -r misc/configs .
         sudo chown -R $(id -un):$(id -gn) . ~/.cargo/
     - name: store-artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-artifacts-linux-${{ matrix.arch }}
         path: |
@@ -82,12 +91,12 @@ jobs:
           configs
 
   nydus-macos:
-    runs-on: macos-13
+    runs-on: macos-15
     strategy:
       matrix:
         arch: [amd64, arm64]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Cache cargo
       uses: Swatinem/rust-cache@v2
       with:
@@ -101,33 +110,32 @@ jobs:
         else
           RUST_TARGET="aarch64-apple-darwin"
         fi
-        cargo install --version 0.2.5 cross
         rustup target add ${RUST_TARGET}
-        make -e RUST_TARGET_STATIC=$RUST_TARGET -e CARGO=cross static-release
-        sudo mv target/$RUST_TARGET/release/nydusd nydusd
+        make -e RUST_TARGET_STATIC=$RUST_TARGET static-release
+        sudo mv target/$RUST_TARGET/release/nydusd .
+        sudo mv target/$RUST_TARGET/release/nydusctl .
         sudo cp -r misc/configs .
         sudo chown -R $(id -un):$(id -gn) . ~/.cargo/
     - name: store-artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-artifacts-darwin-${{ matrix.arch }}
         path: |
           nydusctl
           nydusd
-          nydus-image
           configs
 
   contrib-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
     strategy:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64]
     env:
       DOCKER: false
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - name: Setup Golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6
       with:
         go-version-file: 'go.work'
         cache-dependency-path: "**/*.sum"
@@ -137,7 +145,7 @@ jobs:
         sudo mv contrib/nydusify/cmd/nydusify .
         sudo mv contrib/nydus-overlayfs/bin/nydus-overlayfs .
     - name: store-artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-artifacts-linux-${{ matrix.arch }}-contrib
         path: |
@@ -146,7 +154,7 @@ jobs:
           containerd-nydus-grpc
 
   prepare-tarball-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
     strategy:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64]
@@ -154,7 +162,7 @@ jobs:
     needs: [nydus-linux, contrib-linux]
     steps:
     - name: download artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         pattern: nydus-artifacts-${{ matrix.os }}-${{ matrix.arch }}*
         merge-multiple: true
@@ -171,7 +179,7 @@ jobs:
         sha256sum $tarball > $shasum
         echo "tarball_shasum=${shasum}" >> $GITHUB_ENV
     - name: store-artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-release-tarball-${{ matrix.os }}-${{ matrix.arch }}
         path: |
@@ -180,7 +188,7 @@ jobs:
 
   # use a seperate job for darwin because github action if: condition cannot handle && properly.
   prepare-tarball-darwin:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -188,7 +196,7 @@ jobs:
     needs: [nydus-macos]
     steps:
     - name: download artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydus-artifacts-${{ matrix.os }}-${{ matrix.arch }}
         path: nydus-static
@@ -204,7 +212,7 @@ jobs:
         sha256sum $tarball > $shasum
         echo "tarball_shasum=${shasum}" >> $GITHUB_ENV
     - name: store-artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-release-tarball-${{ matrix.os }}-${{ matrix.arch }}
         path: |
@@ -212,11 +220,15 @@ jobs:
           ${{ env.tarball_shasum }}
 
   create-release:
-    runs-on: ubuntu-latest
-    needs: [prepare-tarball-linux, prepare-tarball-darwin]
+    runs-on: ubuntu-latest-16-cores
+    needs:
+     - has
+     - prepare-tarball-linux
+     - prepare-tarball-darwin
+    if: needs.has.outputs.latest-16
     steps:
     - name: download artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         pattern: nydus-release-tarball-*
         merge-multiple: true
@@ -242,6 +254,7 @@ jobs:
 
 
   goreleaser:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -249,24 +262,24 @@ jobs:
     needs: [nydus-linux, contrib-linux]
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
     timeout-minutes: 60
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Setup Golang
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: 'go.work'
           cache-dependency-path: "**/*.sum"
       - name: download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: nydus-artifacts-${{ matrix.os }}-${{ matrix.arch }}*
           merge-multiple: true
@@ -278,13 +291,13 @@ jobs:
           echo "GOARCH: $GOARCH"
           sh ./goreleaser.sh
       - name: Check GoReleaser config
-        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
         with:
           version: latest
           args: check
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
         id: run-goreleaser
         with:
           version: latest
@@ -310,6 +323,7 @@ jobs:
         run: echo "tag_name=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
 
   provenance:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [goreleaser]
     permissions:
       actions: read # To read the workflow path.

@@ -10,30 +10,28 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-
-	"github.com/containerd/containerd/namespaces"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/backend"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/build"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
-	originprovider "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
-	"github.com/goharbor/acceleration-service/pkg/remote"
-
 	"github.com/BraveY/snapshotter-converter/converter"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/converter/provider"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	containerdErrdefs "github.com/containerd/errdefs"
 	"github.com/dustin/go-humanize"
+	"github.com/goharbor/acceleration-service/pkg/errdefs"
 	"github.com/goharbor/acceleration-service/pkg/platformutil"
+	"github.com/goharbor/acceleration-service/pkg/remote"
 	serverutils "github.com/goharbor/acceleration-service/pkg/utils"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
-	"github.com/containerd/containerd/content"
-	containerdErrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/goharbor/acceleration-service/pkg/errdefs"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/backend"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/build"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/converter/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
+	originprovider "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 // Opt defines Chunkdict generate options.
@@ -131,7 +129,7 @@ func (generator *Generator) pull(ctx context.Context) ([]string, error) {
 		}
 
 		// Create a directory to store the image bootstrap
-		nydusImageName := strings.Replace(generator.Sources[index], "/", ":", -1)
+		nydusImageName := strings.ReplaceAll(generator.Sources[index], "/", ":")
 		bootstrapDirPath := filepath.Join(generator.WorkDir, nydusImageName)
 		if err := os.MkdirAll(bootstrapDirPath, fs.ModePerm); err != nil {
 			return nil, errors.Wrap(err, "creat work directory")
@@ -193,7 +191,7 @@ func (generator *Generator) push(ctx context.Context, chunkdictBootstrapPath str
 		return err
 	}
 
-	pvd, err := provider.New(generator.WorkDir, hosts(generator), 200, "v1", platformMC, 0)
+	pvd, err := provider.New(generator.WorkDir, hosts(generator), 200, "v1", platformMC, 0, nil)
 	if err != nil {
 		return err
 	}

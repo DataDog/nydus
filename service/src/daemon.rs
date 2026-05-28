@@ -171,7 +171,7 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
         self.on_event(DaemonStateMachineInput::Start)
     }
 
-    fn upgrade_mgr(&self) -> Option<MutexGuard<UpgradeManager>> {
+    fn upgrade_mgr(&self) -> Option<MutexGuard<'_, UpgradeManager>> {
         None
     }
 
@@ -481,6 +481,99 @@ impl Default for DaemonController {
 mod tests {
     use super::*;
     use crate::FsBackendType;
+    use std::sync::atomic::AtomicUsize;
+
+    struct MockDaemon {
+        state: Mutex<DaemonState>,
+        events: Mutex<Vec<String>>,
+        stop_calls: AtomicUsize,
+        wait_calls: AtomicUsize,
+    }
+
+    impl MockDaemon {
+        fn new(state: DaemonState) -> Self {
+            Self {
+                state: Mutex::new(state),
+                events: Mutex::new(Vec::new()),
+                stop_calls: AtomicUsize::new(0),
+                wait_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl DaemonStateMachineSubscriber for MockDaemon {
+        fn on_event(&self, event: DaemonStateMachineInput) -> Result<()> {
+            self.events.lock().unwrap().push(format!("{:?}", event));
+            Ok(())
+        }
+    }
+
+    impl NydusDaemon for MockDaemon {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn id(&self) -> Option<String> {
+            Some("mock-id".to_string())
+        }
+
+        fn version(&self) -> BuildTimeInfo {
+            BuildTimeInfo {
+                package_ver: "1.0.0".to_string(),
+                git_commit: "deadbeef".to_string(),
+                build_time: "now".to_string(),
+                profile: "test".to_string(),
+                rustc: "rustc".to_string(),
+            }
+        }
+
+        fn get_state(&self) -> DaemonState {
+            match *self.state.lock().unwrap() {
+                DaemonState::INIT => DaemonState::INIT,
+                DaemonState::RUNNING => DaemonState::RUNNING,
+                DaemonState::READY => DaemonState::READY,
+                DaemonState::STOPPED => DaemonState::STOPPED,
+                DaemonState::UNKNOWN => DaemonState::UNKNOWN,
+            }
+        }
+
+        fn set_state(&self, s: DaemonState) {
+            *self.state.lock().unwrap() = s;
+        }
+
+        fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn umount(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wait(&self) -> Result<()> {
+            self.wait_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn supervisor(&self) -> Option<String> {
+            Some("mock-supervisor".to_string())
+        }
+
+        fn save(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn restore(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn it_should_convert_int_to_daemonstate() {
@@ -504,6 +597,12 @@ mod tests {
     }
 
     #[test]
+    fn it_should_format_daemon_state() {
+        assert_eq!(DaemonState::RUNNING.to_string(), "RUNNING");
+        assert_eq!(DaemonState::STOPPED.to_string(), "STOPPED");
+    }
+
+    #[test]
     fn it_should_convert_str_to_fsbackendtype() {
         let backend_type: FsBackendType = "rafs".parse().unwrap();
         assert_eq!(backend_type, FsBackendType::Rafs);
@@ -512,5 +611,134 @@ mod tests {
         assert_eq!(backend_type, FsBackendType::PassthroughFs);
 
         assert!("xxxxxxxxxxxxx".parse::<FsBackendType>().is_err());
+    }
+
+    #[test]
+    fn it_should_export_daemon_info_without_fs_info() {
+        let daemon = MockDaemon::new(DaemonState::READY);
+        let info = daemon.export_info(false).unwrap();
+
+        assert!(info.contains("\"id\":\"mock-id\""));
+        assert!(info.contains("\"supervisor\":\"mock-supervisor\""));
+        assert!(info.contains("\"state\":\"READY\""));
+        assert!(info.contains("\"backend_collection\":null"));
+    }
+
+    #[test]
+    fn it_should_trigger_stop_based_on_state() {
+        let stopped = MockDaemon::new(DaemonState::STOPPED);
+        assert!(stopped.trigger_stop().is_ok());
+        assert!(stopped.events().is_empty());
+
+        let ready = MockDaemon::new(DaemonState::READY);
+        assert!(ready.trigger_stop().is_ok());
+        assert_eq!(ready.events(), vec!["Stop".to_string()]);
+
+        let running = MockDaemon::new(DaemonState::RUNNING);
+        assert!(running.trigger_stop().is_ok());
+        assert_eq!(
+            running.events(),
+            vec!["Stop".to_string(), "Stop".to_string()]
+        );
+    }
+
+    #[test]
+    fn it_should_trigger_exit_based_on_state() {
+        let stopped = MockDaemon::new(DaemonState::STOPPED);
+        assert!(stopped.trigger_exit().is_ok());
+        assert!(stopped.events().is_empty());
+
+        let init = MockDaemon::new(DaemonState::INIT);
+        assert!(init.trigger_exit().is_ok());
+        assert_eq!(init.events(), vec!["Stop".to_string()]);
+
+        let ready = MockDaemon::new(DaemonState::READY);
+        assert!(ready.trigger_exit().is_ok());
+        assert_eq!(ready.events(), vec!["Exit".to_string()]);
+
+        let running = MockDaemon::new(DaemonState::RUNNING);
+        assert!(running.trigger_exit().is_ok());
+        assert_eq!(
+            running.events(),
+            vec!["Stop".to_string(), "Exit".to_string()]
+        );
+    }
+
+    #[test]
+    fn it_should_format_all_daemon_state_variants() {
+        assert_eq!(DaemonState::INIT.to_string(), "INIT");
+        assert_eq!(DaemonState::READY.to_string(), "READY");
+        assert_eq!(DaemonState::UNKNOWN.to_string(), "UNKNOWN");
+    }
+
+    #[test]
+    fn it_should_convert_edge_int_values_to_daemon_state() {
+        assert_eq!(DaemonState::from(0), DaemonState::UNKNOWN);
+        assert_eq!(DaemonState::from(-1), DaemonState::UNKNOWN);
+        assert_eq!(DaemonState::from(99), DaemonState::UNKNOWN);
+        assert_eq!(DaemonState::from(6), DaemonState::UNKNOWN);
+    }
+
+    #[test]
+    fn it_should_trigger_takeover_and_start() {
+        let daemon = MockDaemon::new(DaemonState::INIT);
+        assert!(daemon.trigger_takeover().is_ok());
+        assert_eq!(daemon.events(), vec!["Takeover".to_string()]);
+
+        let daemon2 = MockDaemon::new(DaemonState::READY);
+        assert!(daemon2.trigger_start().is_ok());
+        assert_eq!(daemon2.events(), vec!["Start".to_string()]);
+    }
+
+    #[test]
+    fn it_should_use_daemon_controller_lifecycle() {
+        let ctrl = DaemonController::new();
+        assert!(ctrl.is_active());
+
+        // get_blob_cache_mgr and get_fs_service return None initially.
+        assert!(ctrl.get_blob_cache_mgr().is_none());
+        assert!(ctrl.get_fs_service().is_none());
+
+        ctrl.notify_shutdown();
+        assert!(!ctrl.is_active());
+    }
+
+    #[test]
+    fn it_should_use_daemon_controller_default() {
+        let ctrl = DaemonController::default();
+        assert!(ctrl.is_active());
+    }
+
+    #[test]
+    fn it_should_set_and_get_daemon() {
+        let ctrl = DaemonController::new();
+
+        // First set returns None (no previous daemon).
+        let d1: Arc<dyn NydusDaemon> = Arc::new(MockDaemon::new(DaemonState::INIT));
+        let prev = ctrl.set_daemon(d1);
+        assert!(prev.is_none());
+
+        // Second set returns the previously stored daemon.
+        let d2: Arc<dyn NydusDaemon> = Arc::new(MockDaemon::new(DaemonState::READY));
+        let prev = ctrl.set_daemon(d2);
+        assert!(prev.is_some());
+
+        // get_daemon returns the latest daemon.
+        assert_eq!(ctrl.get_daemon().get_state(), DaemonState::READY);
+    }
+
+    #[test]
+    fn it_should_set_singleton_mode() {
+        let ctrl = DaemonController::new();
+        // Should not panic; exercises the atomic write path.
+        ctrl.set_singleton_mode(true);
+        ctrl.set_singleton_mode(false);
+    }
+
+    #[test]
+    fn it_should_alloc_waker() {
+        let ctrl = DaemonController::new();
+        let _waker = ctrl.alloc_waker();
+        // alloc_waker returns a cloned Arc<Waker> — must not panic.
     }
 }

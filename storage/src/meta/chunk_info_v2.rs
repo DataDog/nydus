@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{Display, Formatter};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::device::BlobFeatures;
 use crate::meta::{BlobCompressionContext, BlobMetaChunkInfo, BLOB_CCT_CHUNK_SIZE_MASK};
@@ -20,6 +21,8 @@ const CHUNK_V2_FLAG_BATCH: u64 = 0x4 << 56;
 const CHUNK_V2_FLAG_ENCRYPTED: u64 = 0x8 << 56;
 const CHUNK_V2_FLAG_HAS_CRC32: u64 = 0x10 << 56;
 const CHUNK_V2_FLAG_VALID: u64 = 0x1f << 56;
+
+static LAST_WARNED_FLAGS: AtomicU8 = AtomicU8::new(0xFF);
 
 /// Chunk compression information on disk format V2.
 #[repr(C, packed)]
@@ -230,8 +233,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                 && self.uncompressed_size() != self.compressed_size())
             || (self.has_crc32() && self.crc32() == 0)
         {
-            return Err(Error::new(
-                ErrorKind::Other,
+            return Err(Error::other(
                 format!(
                     "invalid chunk, blob: index {}/c_size 0x{:x}/d_size 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} batch {} zran {} encrypted {} has_crc {}, crc32 {}",
                     state.blob_index,
@@ -251,63 +253,52 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
 
         let invalid_flags = self.check_flags();
         if invalid_flags != 0 {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("unknown chunk flags 0x{:x}", invalid_flags),
-            ));
+            let current = LAST_WARNED_FLAGS.load(Ordering::Relaxed);
+            if current != invalid_flags
+                && LAST_WARNED_FLAGS
+                    .compare_exchange(current, invalid_flags, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                warn!("Invalid flags 0x{:x} detected for chunks.", invalid_flags);
+            }
         }
 
         if state.blob_features & BlobFeatures::ZRAN.bits() == 0 && self.is_zran() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                "invalid chunk flag ZRan for non-ZRan blob",
-            ));
+            return Err(Error::other("invalid chunk flag ZRan for non-ZRan blob"));
         } else if self.is_zran() {
             let index = self.get_zran_index()? as usize;
             if index >= state.zran_info_array.len() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "ZRan index {} is too big, max {}",
-                        index,
-                        state.zran_info_array.len()
-                    ),
-                ));
+                return Err(Error::other(format!(
+                    "ZRan index {} is too big, max {}",
+                    index,
+                    state.zran_info_array.len()
+                )));
             }
             let ctx = &state.zran_info_array[index];
             let zran_offset = self.get_zran_offset()?;
             if zran_offset >= ctx.out_size()
                 || zran_offset + self.uncompressed_size() > ctx.out_size()
             {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",
-                        zran_offset,
-                        self.uncompressed_size(),
-                        ctx.out_size()
-                    ),
-                ));
+                return Err(Error::other(format!(
+                    "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",
+                    zran_offset,
+                    self.uncompressed_size(),
+                    ctx.out_size()
+                )));
             }
         }
 
         if self.is_batch() {
             if state.blob_features & BlobFeatures::BATCH.bits() == 0 {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "invalid chunk flag Batch for non-Batch blob",
-                ));
+                return Err(Error::other("invalid chunk flag Batch for non-Batch blob"));
             } else {
                 let index = self.get_batch_index()? as usize;
                 if index >= state.batch_info_array.len() {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "Batch index {} is too big, max {}",
-                            index,
-                            state.batch_info_array.len()
-                        ),
-                    ));
+                    return Err(Error::other(format!(
+                        "Batch index {} is too big, max {}",
+                        index,
+                        state.batch_info_array.len()
+                    )));
                 }
                 let ctx = &state.batch_info_array[index];
                 if ctx.compressed_size() > ctx.uncompressed_batch_size()
@@ -315,7 +306,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                         > ctx.uncompressed_batch_size()
                     || u64::MAX - self.compressed_offset() < ctx.compressed_size() as u64
                 {
-                    return Err(Error::new(ErrorKind::Other, format!(
+                    return Err(Error::other(format!(
                         "Batch Context is invalid: chunk: uncompressed_size 0x{:x}, uncompressed_offset_in_batch_buf 0x{:x}, uncompressed_batch_size 0x{:x}, batch context: index {}, compressed_size 0x{:x}, uncompressed_batch_size 0x{:x}",
                         self.uncompressed_size(),
                         self.get_uncompressed_offset_in_batch_buf()?,
@@ -396,7 +387,8 @@ mod tests {
         let before = chunk.uncomp_info;
         chunk.set_compressed(true);
         chunk.set_compressed(false);
-        assert_eq!(chunk.uncomp_info as u64, before);
+        let uncomp_info = chunk.uncomp_info;
+        assert_eq!(uncomp_info, before);
 
         chunk.set_encrypted(true);
         assert!(chunk.is_encrypted());
@@ -404,17 +396,21 @@ mod tests {
         let before = chunk.uncomp_info;
         chunk.set_batch(true);
         chunk.set_batch(false);
-        assert_eq!(chunk.uncomp_info as u64, before);
+        let uncomp_info = chunk.uncomp_info;
+        assert_eq!(uncomp_info, before);
 
         chunk.set_data(0x10);
-        assert_eq!(chunk.data as u64, 0x10);
+        let data = chunk.data;
+        assert_eq!(data, 0x10);
 
         chunk.set_batch(true);
         chunk.set_batch_index(0x20);
-        assert_eq!(chunk.data as u64, 137438953488);
+        let data = chunk.data;
+        assert_eq!(data, 137438953488);
 
         chunk.set_uncompressed_offset_in_batch_buf(0x30);
-        assert_eq!(chunk.data as u64, 137438953520);
+        let data = chunk.data;
+        assert_eq!(data, 137438953520);
 
         assert_eq!(chunk.flags(), 12);
         assert_eq!(chunk.get_batch_index().unwrap(), 32);
@@ -521,6 +517,28 @@ mod tests {
         assert!(chunk.validate(&ctx).is_err());
 
         chunk.set_zran(false);
+        assert!(chunk.validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn test_unknown_chunk_flags() {
+        let ctx = BlobCompressionContext {
+            compressed_size: 0x10000,
+            uncompressed_size: 0x10000,
+            blob_features: 0,
+            ..Default::default()
+        };
+
+        let mut chunk = BlobChunkInfoV2Ondisk::default();
+        chunk.set_compressed_offset(0x100);
+        chunk.set_compressed_size(0x200);
+        chunk.set_uncompressed_offset(0x1000);
+        chunk.set_uncompressed_size(0x200);
+        chunk.set_compressed(true);
+
+        let invalid_flag = 0x20u64 << 56;
+        chunk.uncomp_info = u64::to_le(u64::from_le(chunk.uncomp_info) | invalid_flag);
+
         assert!(chunk.validate(&ctx).is_ok());
     }
 }

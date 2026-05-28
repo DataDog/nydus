@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
+	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/checker/tool"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
@@ -58,30 +59,13 @@ func New(opt Opt) (*FsViewer, error) {
 		return nil, errors.Wrap(err, "failed to create image provider")
 	}
 	targetParser, err := parser.New(targetRemote, opt.ExpectedArch)
-	if targetParser == nil {
+	if err != nil {
 		return nil, errors.Wrap(err, "failed to create image reference parser")
 	}
 
-	mode := "cached"
-
-	nydusdConfig := tool.NydusdConfig{
-		EnablePrefetch:            opt.Prefetch,
-		NydusdPath:                opt.NydusdPath,
-		BackendType:               opt.BackendType,
-		BackendConfig:             opt.BackendConfig,
-		BootstrapPath:             filepath.Join(opt.WorkDir, "nydus_bootstrap"),
-		ExternalBackendConfigPath: filepath.Join(opt.WorkDir, "nydus_external_backend"),
-		ConfigPath:                filepath.Join(opt.WorkDir, "fs/nydusd_config.json"),
-		BlobCacheDir:              filepath.Join(opt.WorkDir, "fs/nydus_blobs"),
-		MountPath:                 opt.MountPath,
-		APISockPath:               filepath.Join(opt.WorkDir, "fs/nydus_api.sock"),
-		Mode:                      mode,
-	}
-
 	fsViewer := &FsViewer{
-		Opt:          opt,
-		Parser:       targetParser,
-		NydusdConfig: nydusdConfig,
+		Opt:    opt,
+		Parser: targetParser,
 	}
 
 	return fsViewer, nil
@@ -117,11 +101,13 @@ func (fsViewer *FsViewer) PullBootstrap(ctx context.Context, targetParsed *parse
 			return errors.Wrap(err, "failed to unpack Nydus bootstrap layer")
 		}
 
-		logrus.Infof("Pulling Nydus external backend to %s", target)
-		target = fsViewer.NydusdConfig.ExternalBackendConfigPath
-		if err := fsViewer.getBootstrapFile(ctx, targetParsed.NydusImage, utils.BackendFileNameInLayer, target); err != nil {
-			if !strings.Contains(err.Error(), "Not found") {
-				return errors.Wrap(err, "failed to unpack Nydus external backend layer")
+		externalBackendConfig := fsViewer.NydusdConfig.ExternalBackendConfigPath
+		if externalBackendConfig != "" {
+			logrus.Infof("Pulling Nydus external backend config to %s", externalBackendConfig)
+			if err := fsViewer.getBootstrapFile(ctx, targetParsed.NydusImage, utils.BackendFileNameInLayer, externalBackendConfig); err != nil {
+				if !strings.Contains(err.Error(), "Not found") {
+					return errors.Wrap(err, "failed to unpack Nydus external backend layer")
+				}
 			}
 		}
 	}
@@ -187,6 +173,25 @@ func (fsViewer *FsViewer) view(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to parse image reference")
 	}
+
+	isModelArtifact := targetParsed.NydusImage.Manifest.ArtifactType == modelspec.ArtifactTypeModelManifest
+	nydusdConfig := tool.NydusdConfig{
+		EnablePrefetch: fsViewer.Prefetch,
+		NydusdPath:     fsViewer.NydusdPath,
+		BackendType:    fsViewer.BackendType,
+		BackendConfig:  fsViewer.BackendConfig,
+		BootstrapPath:  filepath.Join(fsViewer.WorkDir, "nydus_bootstrap"),
+		ConfigPath:     filepath.Join(fsViewer.WorkDir, "fs/nydusd_config.json"),
+		BlobCacheDir:   filepath.Join(fsViewer.WorkDir, "fs/nydus_blobs"),
+		MountPath:      fsViewer.MountPath,
+		APISockPath:    filepath.Join(fsViewer.WorkDir, "fs/nydus_api.sock"),
+		Mode:           "direct",
+	}
+	if isModelArtifact {
+		nydusdConfig.ExternalBackendConfigPath = filepath.Join(fsViewer.WorkDir, "fs/nydusd_backend.json")
+	}
+	fsViewer.NydusdConfig = nydusdConfig
+
 	err = fsViewer.PullBootstrap(ctx, targetParsed)
 	if err != nil {
 		return errors.Wrap(err, "failed to pull Nydus image bootstrap")

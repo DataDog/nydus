@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, Result};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -24,8 +24,8 @@ use crate::http_endpoint_common::{
     SendFuseFdHandler, StartHandler, TakeoverFuseFdHandler,
 };
 use crate::http_endpoint_v1::{
-    FsBackendInfo, InfoHandler, MetricsFsAccessPatternHandler, MetricsFsFilesHandler,
-    MetricsFsGlobalHandler, MetricsFsInflightHandler, HTTP_ROOT_V1,
+    ConfigHandler, FsBackendInfo, InfoHandler, MetricsFsAccessPatternHandler,
+    MetricsFsFilesHandler, MetricsFsGlobalHandler, MetricsFsInflightHandler, HTTP_ROOT_V1,
 };
 use crate::http_endpoint_v2::{BlobObjectListHandlerV2, InfoV2Handler, HTTP_ROOT_V2};
 
@@ -58,6 +58,7 @@ pub fn extract_query_part(req: &Request, key: &str) -> Option<String> {
 }
 
 /// Parse HTTP request body.
+#[allow(clippy::result_large_err)]
 pub(crate) fn parse_body<'a, F: Deserialize<'a>>(b: &'a Body) -> std::result::Result<F, HttpError> {
     serde_json::from_slice::<F>(b.raw()).map_err(HttpError::ParseBody)
 }
@@ -99,6 +100,7 @@ pub(crate) fn error_response(error: HttpError, status: StatusCode) -> Response {
 }
 
 /// Trait for HTTP endpoints to handle HTTP requests.
+#[allow(clippy::result_large_err)]
 pub trait EndpointHandler: Sync + Send {
     /// Handles an HTTP request.
     ///
@@ -156,6 +158,7 @@ lazy_static! {
         r.routes.insert(endpoint_v1!("/metrics/files"), Box::new(MetricsFsFilesHandler{}));
         r.routes.insert(endpoint_v1!("/metrics/inflight"), Box::new(MetricsFsInflightHandler{}));
         r.routes.insert(endpoint_v1!("/metrics/pattern"), Box::new(MetricsFsAccessPatternHandler{}));
+        r.routes.insert(endpoint_v1!("/config"), Box::new(ConfigHandler{}));
 
         // Nydus API, v2
         r.routes.insert(endpoint_v2!("/daemon"), Box::new(InfoV2Handler{}));
@@ -165,6 +168,7 @@ lazy_static! {
     };
 }
 
+#[allow(clippy::result_large_err)]
 fn kick_api_server(
     to_api: &Sender<Option<ApiRequest>>,
     from_api: &Receiver<ApiResponse>,
@@ -250,7 +254,7 @@ pub fn start_http_thread(
         if let ServerError::IOError(e) = e {
             e
         } else {
-            Error::new(ErrorKind::Other, format!("{:?}", e))
+            Error::other(format!("{:?}", e))
         }
     })?;
     poll.registry().register(
@@ -400,5 +404,76 @@ mod tests {
         let msg = from_route.recv().unwrap();
         assert!(msg.is_none());
         let _ = thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_translate_status_code() {
+        use crate::{ApiError, DaemonErrorKind, MetricsError, MetricsErrorKind};
+
+        assert_eq!(
+            translate_status_code(&ApiError::DaemonAbnormal(DaemonErrorKind::NotReady)),
+            StatusCode::ServiceUnavailable
+        );
+        assert_eq!(
+            translate_status_code(&ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported)),
+            StatusCode::NotImplemented
+        );
+        assert_eq!(
+            translate_status_code(&ApiError::DaemonAbnormal(DaemonErrorKind::UnexpectedEvent(
+                "ev".into()
+            ))),
+            StatusCode::BadRequest
+        );
+        // Other DaemonErrorKind → InternalServerError
+        assert_eq!(
+            translate_status_code(&ApiError::DaemonAbnormal(DaemonErrorKind::Other(
+                "x".into()
+            ))),
+            StatusCode::InternalServerError
+        );
+        // Metrics NoCounter → NotFound
+        assert_eq!(
+            translate_status_code(&ApiError::Metrics(MetricsErrorKind::Stats(
+                MetricsError::NoCounter
+            ))),
+            StatusCode::NotFound
+        );
+        // Catch-all → InternalServerError
+        assert_eq!(
+            translate_status_code(&ApiError::ResponsePayloadType),
+            StatusCode::InternalServerError
+        );
+        // MountFilesystem variant
+        assert_eq!(
+            translate_status_code(&ApiError::MountFilesystem(DaemonErrorKind::Unsupported)),
+            StatusCode::NotImplemented
+        );
+    }
+
+    #[test]
+    fn test_success_response() {
+        let resp_with_body = success_response(Some("hello".into()));
+        assert_eq!(resp_with_body.status(), StatusCode::OK);
+
+        let resp_no_body = success_response(None);
+        assert_eq!(resp_no_body.status(), StatusCode::NoContent);
+    }
+
+    #[test]
+    fn test_error_response() {
+        let resp = error_response(HttpError::NoRoute, StatusCode::NotFound);
+        assert_eq!(resp.status(), StatusCode::NotFound);
+    }
+
+    #[test]
+    fn test_parse_body() {
+        let body = Body::new(r#"{"key":"value"}"#.to_string());
+        let result: std::result::Result<serde_json::Value, HttpError> = parse_body(&body);
+        assert!(result.is_ok());
+
+        let bad_body = Body::new("not json".to_string());
+        let result: std::result::Result<serde_json::Value, HttpError> = parse_body(&bad_body);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), HttpError::ParseBody(_)));
     }
 }

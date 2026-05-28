@@ -257,8 +257,12 @@ Document located at: https://github.com/adamqqqplay/nydus-localdisk/blob/master/
         "scheme": "",
         // Registry hostname with format `$host:$port`
         "host": "my-registry:5000",
-        // Skip SSL certificate validation for HTTPS scheme
+        // Skip SSL certificate validation for HTTPS scheme.
+        // When true, also allows automatic HTTPS-to-HTTP fallback on TLS errors.
         "skip_verify": false,
+        // Paths to PEM-encoded CA certificate files to trust in addition to the system CA store, optional.
+        // Useful when the registry uses a private or self-signed CA.
+        "ca_cert_files": ["/etc/ssl/certs/my-ca.pem"],
         // Use format `$namespace/$repo` (no image tag)
         "repo": "test/repo",
         // Username and password for auth
@@ -510,3 +514,48 @@ mnt
 ├── pseudo_1
 └── pseudo_2
 ```
+
+### Hot Reload Configuration
+
+Nydusd supports hot reloading of configuration without restarting the daemon. This is useful for updating credentials or other settings at runtime.
+
+#### Update Configuration
+
+To update configuration (e.g., registry authentication):
+
+```shell
+curl --unix-socket /path/to/api.sock \
+  -X PUT "http://localhost/api/v1/config?id=/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "registry_auth": "<base64_encoded_auth>"
+  }'
+```
+
+#### Query Current Configuration
+
+To retrieve the current configuration:
+
+```shell
+curl --unix-socket /path/to/api.sock \
+  -X GET "http://localhost/api/v1/config?id=/"
+```
+
+Example response:
+
+```json
+{
+  "registry_auth": "<base64_encoded_auth>"
+}
+```
+
+> **Note**: The `id` parameter specifies which mountpoint to configure. Use `/` for the root mountpoint or specify a sub-mountpoint path for multi-mount scenarios.
+
+#### Supported Configuration Fields
+
+The following fields can be updated via the hot reload API:
+
+| Field           | Description                                                               |
+| --------------- | ------------------------------------------------------------------------- |
+| `registry_auth` | Base64-encoded `username:password` credential for registry authentication |
+

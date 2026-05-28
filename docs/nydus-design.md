@@ -26,7 +26,7 @@ Nydus takes in either [FUSE](https://www.kernel.org/doc/html/latest/filesystems/
 ![architecture](images/nydusd-arch.png)
 
 ##    2. Rafs
-Rafs is a filesystem image containing a separated metadata blob and several data-deduplicated content-addressable data blobs.  In a typical rafs filesystem, the metadata is stored in `bootstrap` while the data is stored in `blobfile`. Nydus splits container image into two parts, metadata and data, where metadata contains everything a container needs to start with, while data is stored in chunks with chunk size being 1MB. Currently, Rafs has two versions called `Rafs v5` (which is a FUSE-based filesystem) and `Rafs v6` (which is compatible with the in-kernel EROFS filesystem). Note that, the following details are all about `Rafs v5` and meterials about `Raft v6` are still working in progress.
+Rafs is a filesystem image containing a separated metadata blob and several data-deduplicated content-addressable data blobs.  In a typical rafs filesystem, the metadata is stored in `bootstrap` while the data is stored in `blobfile`. Nydus splits container image into two parts, metadata and data, where metadata contains everything a container needs to start with, while data is stored in chunks with chunk size being 1MB. Currently, Rafs has two versions called `Rafs v5` (which is a FUSE-based filesystem) and `Rafs v6` (which is compatible with the in-kernel EROFS filesystem). Note that, the following details are all about `Rafs v5` and materials about `Rafs v6` are still working in progress.
 
 ![rafs](./images/rafs-format.png)
 
@@ -68,7 +68,7 @@ Rafs is a filesystem image containing a separated metadata blob and several data
 |            |           |                                                 |
 +------------+-----------+-------------------------------------------------+
 ```
-   
+
 ##    3. Integrity Validation
 ### 3.1 Metadata Integrity Validation
 Firstly, Nydus does basic verification of metadata values, looking for values that are in range (and hence not detected by automated verification checks) but are not correct.
@@ -185,9 +185,9 @@ pub struct OndiskInodeWrapper<'a> {
     pub inode: &'a OndiskInode,
 }
 ```
- 
+
 The OndiskInode struct size is padded to 128 bytes.
-   
+
 * If it's a directory, all its children are indexed contiguously in `inode table`, and `i_child_index` is the index of the first child and `i_child_count` is the amount of its children.
 * If it's a file, `i_child_index` is not used.
 *`i_name_size` is the length of its name.
@@ -248,7 +248,7 @@ pub struct OndiskXAttrs {
 }
 ```
 
-A list of `OndiskChunkInfo` is also stored after xattr if the inode contains file data.  Each chunk info tells us where to find data in blob file, it contains 
+A list of `OndiskChunkInfo` is also stored after xattr if the inode contains file data.  Each chunk info tells us where to find data in blob file, it contains
 - the hash value `block_id` calculated from the chunk data,
 - the blob file it belongs to,
 - whether the chunk is compressed,
@@ -323,7 +323,7 @@ pub struct OndiskBlobTable {
 Nydus manifest is designed to be fully compatible with OCI image spec and distribution spec by adding an extra manifest file to store the pointers of nydus bootstrap (i.e. metadata) and blobfile (i.e. data).
 
 ## 1. Image Index
-A typical image index enabling nydus points to two manifest files, one is the traditional OCI v1 image manifest, the other is the nydus manifest that takes advantage of `platform` and puts `os.features: ["nydus.remoteimage.v1"]` field under `platform`.
+A typical image index enabling nydus points to two manifest files, one is the traditional OCI v1 image manifest, the other is the nydus manifest that takes advantage of `artifactType` and puts `application/vnd.nydus.image.manifest.v1+json` as a value to identify the nydus image.
 
 ```json
 {
@@ -344,11 +344,9 @@ A typical image index enabling nydus points to two manifest files, one is the tr
       "digest": "sha256:9e2bcf20f78c9ca1a5968a9228d73d85f27846904ddd9f6c10ef2263e13cec4f",
       "platform": {
         "architecture": "amd64",
-        "os": "linux",
-        "os.features": [
-          "nydus.remoteimage.v1"
-        ]
-      }
+        "os": "linux"
+      },
+      "artifactType": "application/vnd.nydus.image.manifest.v1+json"
     }
   ]
 }

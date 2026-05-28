@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/crates/l/nydus-rs)](https://crates.io/crates/nydus-rs)
 [![Twitter](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2Fdragonfly_oss)](https://twitter.com/dragonfly_oss)
 [![Nydus Stars](https://img.shields.io/github/stars/dragonflyoss/nydus?label=Nydus%20Stars&style=social)](https://github.com/dragonflyoss/nydus)
-[<img src="https://app.devin.ai/devin_v4.png" width="20" title="deepwiki">](https://deepwiki.com/dragonflyoss/nydus)
+[![Nydus DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/dragonflyoss/nydus)
 
 [![Smoke Test](https://github.com/dragonflyoss/nydus/actions/workflows/smoke.yml/badge.svg?event=schedule)](https://github.com/dragonflyoss/nydus/actions/workflows/smoke.yml?query=event%3Aschedule)
 [![Image Conversion](https://github.com/dragonflyoss/nydus/actions/workflows/convert.yml/badge.svg?event=schedule)](https://github.com/dragonflyoss/nydus/actions/workflows/convert.yml?query=event%3Aschedule)
@@ -48,15 +48,15 @@ The following Benchmarking results demonstrate that Nydus images significantly o
 ## Ecosystem
 ### Nydus tools
 
-| Tool                                                                                                 | Description                                                                                                                                                |
-| ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool                                                                                         | Description                                                                                                                                                |
+| -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [nydusd](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusd.md)                   | Nydus user-space daemon, it processes all fscache/FUSE messages from the kernel and parses Nydus images to fullfil those requests                          |
 | [nydus-image](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)         | Convert a single layer of OCI format container image into a nydus format container image generating meta part file and data part file respectively         |
 | [nydusify](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusify.md)               | It pulls OCI image down and unpack it, invokes `nydus-image create` to convert image and then pushes the converted image back to registry and data storage |
 | [nydusctl](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)            | Nydusd CLI client (`nydus-image inspect`), query daemon's working status/metrics and configure it                                                          |
-| [nydus-docker-graphdriver](https://github.com/nydusaccelerator/docker-nydus-graphdriver)             | [Experimental] Works as a `docker` remote graph driver to control how images and containers are stored and managed                                         |
+| [nydus-docker-graphdriver](https://github.com/nydusaccelerator/docker-nydus-graphdriver)     | [Experimental] Works as a `docker` remote graph driver to control how images and containers are stored and managed                                         |
 | [nydus-overlayfs](https://github.com/dragonflyoss/nydus/tree/master/contrib/nydus-overlayfs) | `Containerd` mount helper to invoke overlayfs mount with tweaking mount options a bit. So nydus prerequisites can be passed to vm-based runtime            |
-| [nydus-backend-proxy](./contrib/nydus-backend-proxy/README.md)                                       | A simple HTTP server to serve local directory as a blob backend for nydusd                                                                                 |
+| [nydus-backend-proxy](./contrib/nydus-backend-proxy/README.md)                               | A simple HTTP server to serve local directory as a blob backend for nydusd                                                                                 |
 
 ### Supported platforms
 
@@ -64,10 +64,10 @@ The following Benchmarking results demonstrate that Nydus images significantly o
 | ------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
 | Storage       | Registry/OSS/S3/NAS                                                                                             | Support for OCI-compatible distribution implementations such as Docker Hub, Harbor, Github GHCR, Aliyun ACR, NAS, and Aliyun OSS-like object storage service | ✅      |
 | Storage/Build | [Harbor](https://github.com/goharbor/acceleration-service)                                                      | Provides a general service for Harbor to support acceleration image conversion based on kinds of accelerator like Nydus and eStargz etc                      | ✅      |
-| Distribution  | [Dragonfly](https://github.com/dragonflyoss/dragonfly)                                                         | Improve the runtime performance of Nydus image even further with the Dragonfly P2P data distribution system                                                  | ✅      |
-| Build         | [Buildkit](https://github.com/nydusaccelerator/buildkit/blob/master/docs/nydus.md)                                          | Provides the ability to build and export Nydus images directly from Dockerfile                                                                               | ✅      |
+| Distribution  | [Dragonfly](https://github.com/dragonflyoss/dragonfly)                                                          | Improve the runtime performance of Nydus image even further with the Dragonfly P2P data distribution system                                                  | ✅      |
+| Build         | [Buildkit](https://github.com/nydusaccelerator/buildkit/blob/master/docs/nydus.md)                              | Provides the ability to build and export Nydus images directly from Dockerfile                                                                               | ✅      |
 | Build/Runtime | [Nerdctl](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md)                                      | The containerd client to build or run (requires nydus snapshotter) Nydus image                                                                               | ✅      |
-| Runtime       | [Docker / Moby](https://github.com/dragonflyoss/nydus/blob/master/docs/docker-env-setup.md)             | Run Nydus image in Docker container with containerd and nydus-snapshotter                                                                                    | ✅      |
+| Runtime       | [Docker / Moby](https://github.com/dragonflyoss/nydus/blob/master/docs/docker-env-setup.md)                     | Run Nydus image in Docker container with containerd and nydus-snapshotter                                                                                    | ✅      |
 | Runtime       | [Kubernetes](https://github.com/containerd/nydus-snapshotter/blob/main/docs/run_nydus_in_kubernetes.md)         | Run Nydus image using CRI interface                                                                                                                          | ✅      |
 | Runtime       | [Containerd](https://github.com/containerd/nydus-snapshotter)                                                   | Nydus Snapshotter, a containerd remote plugin to run Nydus image                                                                                             | ✅      |
 | Runtime       | [CRI-O / Podman](https://github.com/containers/nydus-storage-plugin)                                            | Run Nydus image with CRI-O or Podman                                                                                                                         | 🚧      |
@@ -169,6 +169,4 @@ Feel free to reach us via Slack or Dingtalk.
 
 - **Twitter:** [@dragonfly_oss](https://twitter.com/dragonfly_oss)
 
-- **Dingtalk:** [34971767](https://qr.dingtalk.com/action/joingroup?code=v1,k1,ioWGzuDZEIO10Bf+/ohz4RcQqAkW0MtOwoG1nbbMxQg=&_dt_no_comment=1&origin=11)
-
-<img src="./misc/dingtalk.jpg" width="250" height="300"/>
+- **Dingtalk Group Number:** 34971767

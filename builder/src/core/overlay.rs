@@ -57,11 +57,12 @@ pub const OVERLAYFS_WHITEOUT_OPAQUE: &str = "trusted.overlay.opaque";
 ///   may remove all of the children using an opaque whiteout entry.
 /// - An opaque whiteout entry is a file with the name .wh..wh..opq indicating that all siblings
 ///   are hidden in the lower layer.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub enum WhiteoutSpec {
     /// Overlay whiteout rules according to the OCI image specification.
     ///
     /// https://github.com/opencontainers/image-spec/blob/master/layer.md#whiteouts
+    #[default]
     Oci,
     /// Overlay whiteout rules according to the Linux Overlayfs specification.
     ///
@@ -78,12 +79,6 @@ impl fmt::Display for WhiteoutSpec {
             WhiteoutSpec::Overlayfs => write!(f, "overlayfs"),
             WhiteoutSpec::None => write!(f, "none"),
         }
-    }
-}
-
-impl Default for WhiteoutSpec {
-    fn default() -> Self {
-        Self::Oci
     }
 }
 
@@ -208,7 +203,7 @@ impl Node {
             if t == WhiteoutType::OciRemoval {
                 // the whiteout filename prefixes the basename of the path to be deleted with ".wh.".
                 return Some(OsStr::from_bytes(
-                    name[OCISPEC_WHITEOUT_PREFIX.len()..].as_bytes(),
+                    &name.as_bytes()[OCISPEC_WHITEOUT_PREFIX.len()..],
                 ));
             } else if t == WhiteoutType::OverlayFsRemoval {
                 // the whiteout file has the same name as the file to be deleted.
@@ -234,9 +229,14 @@ mod tests {
         assert!(matches!(spec, WhiteoutSpec::Oci));
 
         assert!(WhiteoutSpec::from_str("oci").is_ok());
+        assert!(WhiteoutSpec::from_str("OCI").is_ok());
         assert!(WhiteoutSpec::from_str("overlayfs").is_ok());
         assert!(WhiteoutSpec::from_str("none").is_ok());
         assert!(WhiteoutSpec::from_str("foo").is_err());
+
+        assert_eq!(WhiteoutSpec::Oci.to_string(), "oci");
+        assert_eq!(WhiteoutSpec::Overlayfs.to_string(), "overlayfs");
+        assert_eq!(WhiteoutSpec::None.to_string(), "none");
     }
 
     #[test]
@@ -260,12 +260,16 @@ mod tests {
         assert!(t1.is_lower_layer());
         assert!(!t2.is_lower_layer());
         assert!(!t3.is_lower_layer());
+
+        assert_eq!(t1.to_string(), "LOWER");
+        assert_eq!(t2.to_string(), "ADDED");
+        assert_eq!(t3.to_string(), "MODIFIED");
     }
 
     #[test]
     fn test_node() {
         let mut inode = InodeWrapper::V5(RafsV5Inode::default());
-        inode.set_mode(libc::S_IFCHR as u32);
+        inode.set_mode(crate::mode_bits(libc::S_IFCHR));
         let node = Node::new(inode, NodeInfo::default(), 0);
         assert!(!node.is_overlayfs_whiteout(WhiteoutSpec::None));
         assert!(node.is_overlayfs_whiteout(WhiteoutSpec::Overlayfs));
@@ -280,7 +284,7 @@ mod tests {
             .xattrs
             .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
             .is_ok());
-        inode.set_mode(libc::S_IFDIR as u32);
+        inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
         assert!(node.is_overlayfs_opaque(WhiteoutSpec::Overlayfs));
@@ -295,7 +299,7 @@ mod tests {
             .xattrs
             .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
             .is_ok());
-        inode.set_mode(libc::S_IFDIR as u32);
+        inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::Overlayfs));
@@ -306,7 +310,7 @@ mod tests {
             .xattrs
             .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
             .is_ok());
-        inode.set_mode(libc::S_IFCHR as u32);
+        inode.set_mode(crate::mode_bits(libc::S_IFCHR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::Overlayfs));
@@ -317,7 +321,7 @@ mod tests {
             .xattrs
             .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
             .is_ok());
-        inode.set_mode(libc::S_IFDIR as u32);
+        inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::Overlayfs));

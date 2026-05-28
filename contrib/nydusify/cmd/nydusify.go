@@ -13,12 +13,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/optimizer"
-
-	"github.com/containerd/containerd/reference/docker"
 	"github.com/distribution/reference"
 	"github.com/dustin/go-humanize"
 	"github.com/pkg/errors"
@@ -30,6 +28,7 @@ import (
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/committer"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/converter"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/copier"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/optimizer"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/packer"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
@@ -103,14 +102,14 @@ func getBackendConfig(c *cli.Context, prefix string, required bool) (string, str
 // Source: localhost:5000/nginx:latest
 // Target: localhost:5000/nginx:latest-suffix
 func addReferenceSuffix(source, suffix string) (string, error) {
-	named, err := docker.ParseDockerRef(source)
+	named, err := reference.ParseDockerRef(source)
 	if err != nil {
 		return "", fmt.Errorf("invalid source image reference: %s", err)
 	}
-	if _, ok := named.(docker.Digested); ok {
+	if _, ok := named.(reference.Digested); ok {
 		return "", fmt.Errorf("unsupported digested image reference: %s", named.String())
 	}
-	named = docker.TagNameOnly(named)
+	named = reference.TagNameOnly(named)
 	target := named.String() + suffix
 	return target, nil
 }
@@ -141,11 +140,11 @@ func getCacheReference(c *cli.Context, target string) (string, error) {
 		return "", fmt.Errorf("--build-cache conflicts with --build-cache-tag")
 	}
 	if cacheTag != "" {
-		named, err := docker.ParseDockerRef(target)
+		named, err := reference.ParseDockerRef(target)
 		if err != nil {
 			return "", fmt.Errorf("invalid target image reference: %s", err)
 		}
-		cache = fmt.Sprintf("%s/%s:%s", docker.Domain(named), docker.Path(named), cacheTag)
+		cache = fmt.Sprintf("%s/%s:%s", reference.Domain(named), reference.Path(named), cacheTag)
 	}
 	return cache, nil
 }
@@ -179,6 +178,30 @@ func getPrefetchPatterns(c *cli.Context) (string, error) {
 	return patterns, nil
 }
 
+// validateSourceAndTargetArchives validates that the source and target archives point to valid paths
+func validateSourceAndTargetArchives(c *cli.Context) error {
+	sourceArchive := c.String("source-archive")
+	// Validate source archive exists
+	if sourceArchive != "" {
+		if _, err := os.Stat(sourceArchive); err != nil {
+			return errors.Wrapf(err, "source archive not accessible: %s", sourceArchive)
+		}
+	}
+
+	// Validate target archive directory exists
+	targetArchive := c.String("target-archive")
+	if targetArchive != "" {
+		dir := filepath.Dir(targetArchive)
+		if dir != "" {
+			if _, err := os.Stat(dir); err != nil {
+				return errors.Wrapf(err, "target archive directory not accessible: %s", dir)
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
@@ -206,11 +229,23 @@ func main() {
 					Usage:    "Source OCI image reference",
 					EnvVars:  []string{"SOURCE"},
 				},
+				&cli.PathFlag{
+					Name:      "source-archive",
+					TakesFile: true,
+					Usage:     "Path to source OCI image layout tar archive",
+					EnvVars:   []string{"SOURCE_ARCHIVE"},
+				},
 				&cli.StringFlag{
 					Name:     "target",
 					Required: false,
 					Usage:    "Target (Nydus) image reference",
 					EnvVars:  []string{"TARGET"},
+				},
+				&cli.PathFlag{
+					Name:      "target-archive",
+					TakesFile: false,
+					Usage:     "Path to target OCI image layout tar archive",
+					EnvVars:   []string{"TARGET_ARCHIVE"},
 				},
 				&cli.StringFlag{
 					Name:    "source-backend-type",
@@ -353,6 +388,12 @@ func main() {
 					EnvVars: []string{"OCI"},
 				},
 				&cli.BoolFlag{
+					Name:    "reverse",
+					Value:   false,
+					Usage:   "Perform reverse conversion from Nydus format to OCI format. Do not use this option if the source is in OCI format, as it is not supported. Note: This Nydus to OCI reverse conversion feature is currently experimental.",
+					EnvVars: []string{"REVERSE"},
+				},
+				&cli.BoolFlag{
 					Name:   "docker-v2-format",
 					Value:  false,
 					Hidden: true,
@@ -432,9 +473,25 @@ func main() {
 					Usage:   "Enable plain http for Nydus image push",
 					EnvVars: []string{"PLAIN_HTTP"},
 				},
+				&cli.IntFlag{
+					Name:    "push-retry-count",
+					Value:   3,
+					Usage:   "Number of retries when pushing to registry fails",
+					EnvVars: []string{"PUSH_RETRY_COUNT"},
+				},
+				&cli.StringFlag{
+					Name:    "push-retry-delay",
+					Value:   "5s",
+					Usage:   "Delay between push retries (e.g. 5s, 1m, 1h)",
+					EnvVars: []string{"PUSH_RETRY_DELAY"},
+				},
 			},
 			Action: func(c *cli.Context) error {
 				setupLogLevel(c)
+
+				if err := validateSourceAndTargetArchives(c); err != nil {
+					return err
+				}
 
 				targetRef, err := getTargetReference(c)
 				if err != nil {
@@ -493,6 +550,15 @@ func main() {
 					docker2OCI = true
 				}
 
+				// Check if this is a reverse conversion (Nydus to OCI)
+				if c.Bool("reverse") {
+					converted, err := tryReverseConvert(c, targetRef)
+					if converted {
+						return err
+					}
+				}
+
+				// Forward conversion: OCI to Nydus (existing logic)
 				opt := converter.Opt{
 					WorkDir:        c.String("work-dir"),
 					NydusImagePath: c.String("nydus-image"),
@@ -500,7 +566,9 @@ func main() {
 					SourceBackendType:   c.String("source-backend-type"),
 					SourceBackendConfig: c.String("source-backend-config"),
 					Source:              c.String("source"),
+					SourceArchive:       c.String("source-archive"),
 					Target:              targetRef,
+					TargetArchive:       c.String("target-archive"),
 					SourceInsecure:      c.Bool("source-insecure"),
 					TargetInsecure:      c.Bool("target-insecure"),
 
@@ -530,8 +598,10 @@ func main() {
 					AllPlatforms: c.Bool("all-platforms"),
 					Platforms:    c.String("platform"),
 
-					OutputJSON:    c.String("output-json"),
-					WithPlainHTTP: c.Bool("plain-http"),
+					OutputJSON:     c.String("output-json"),
+					WithPlainHTTP:  c.Bool("plain-http"),
+					PushRetryCount: c.Int("push-retry-count"),
+					PushRetryDelay: c.String("push-retry-delay"),
 				}
 
 				return converter.Convert(context.Background(), opt)
@@ -1258,9 +1328,51 @@ func main() {
 					Value: "0MB",
 					Usage: "Chunk size for pushing a blob layer in chunked",
 				},
+
+				&cli.StringFlag{
+					Name:    "source-backend-type",
+					Value:   "",
+					Usage:   "Type of storage backend, enable verification of file data in Nydus image if specified, possible values: 'oss', 's3', 'localfs'",
+					EnvVars: []string{"BACKEND_TYPE"},
+				},
+				&cli.StringFlag{
+					Name:    "source-backend-config",
+					Value:   "",
+					Usage:   "Json string for storage backend configuration",
+					EnvVars: []string{"BACKEND_CONFIG"},
+				},
+				&cli.PathFlag{
+					Name:      "source-backend-config-file",
+					Value:     "",
+					TakesFile: true,
+					Usage:     "Json configuration file for storage backend",
+					EnvVars:   []string{"BACKEND_CONFIG_FILE"},
+				},
 			},
 			Action: func(c *cli.Context) error {
 				setupLogLevel(c)
+
+				backendType, backendConfig, err := getBackendConfig(c, "source-", false)
+				if err != nil {
+					return err
+				} else if backendConfig == "" {
+					backendType = "registry"
+					parsed, err := reference.ParseNormalizedNamed(c.String("target"))
+					if err != nil {
+						return err
+					}
+
+					backendConfigStruct, err := utils.NewRegistryBackendConfig(parsed, c.Bool("target-insecure"))
+					if err != nil {
+						return errors.Wrap(err, "parse registry backend configuration")
+					}
+
+					bytes, err := json.Marshal(backendConfigStruct)
+					if err != nil {
+						return errors.Wrap(err, "marshal registry backend configuration")
+					}
+					backendConfig = string(bytes)
+				}
 
 				pushChunkSize, err := humanize.ParseBytes(c.String("push-chunk-size"))
 				if err != nil {
@@ -1283,6 +1395,9 @@ func main() {
 
 					PushChunkSize:     int64(pushChunkSize),
 					PrefetchFilesPath: c.String("prefetch-files"),
+
+					BackendType:   backendType,
+					BackendConfig: backendConfig,
 				}
 
 				return optimizer.Optimize(context.Background(), opt)
@@ -1328,6 +1443,12 @@ func main() {
 					Required: true,
 					Usage:    "Target nydus image reference",
 					EnvVars:  []string{"TARGET"},
+				},
+				&cli.StringFlag{
+					Name:     "source-image-ref",
+					Required: false,
+					Usage:    "Override the source nydus image reference (useful when containerd uses hosts.toml remapping)",
+					EnvVars:  []string{"SOURCE_IMAGE_REF"},
 				},
 				&cli.BoolFlag{
 					Name:     "source-insecure",
@@ -1384,6 +1505,7 @@ func main() {
 					ContainerdAddress: c.String("containerd-address"),
 					Namespace:         c.String("namespace"),
 					ContainerID:       c.String("container"),
+					SourceImageRef:    c.String("source-image-ref"),
 					TargetRef:         c.String("target"),
 					SourceInsecure:    c.Bool("source-insecure"),
 					TargetInsecure:    c.Bool("target-insecure"),
@@ -1443,7 +1565,8 @@ func getGlobalFlags() []cli.Flag {
 			Required: false,
 			Value:    false,
 			Usage:    "Enable debug log level, overwrites the 'log-level' option",
-			EnvVars:  []string{"DEBUG_LOG_LEVEL"}},
+			EnvVars:  []string{"DEBUG_LOG_LEVEL"},
+		},
 		&cli.StringFlag{
 			Name:    "log-level",
 			Aliases: []string{"l"},
@@ -1458,4 +1581,29 @@ func getGlobalFlags() []cli.Flag {
 			EnvVars:  []string{"LOG_FILE"},
 		},
 	}
+}
+
+// tryReverseConvert attempts to perform reverse conversion from Nydus to OCI
+func tryReverseConvert(c *cli.Context, targetRef string) (bool, error) {
+	// Source image is in Nydus format, perform reverse conversion
+	logrus.Info("Detected Nydus source image, performing reverse conversion to OCI")
+
+	// Build reverse conversion options using unified Opt
+	reverseOpt := converter.Opt{
+		WorkDir:        c.String("work-dir"),
+		NydusImagePath: c.String("nydus-image"),
+		Source:         c.String("source"),
+		Target:         targetRef,
+		SourceInsecure: c.Bool("source-insecure"),
+		TargetInsecure: c.Bool("target-insecure"),
+		AllPlatforms:   c.Bool("all-platforms"),
+		Platforms:      c.String("platform"),
+		OutputJSON:     c.String("output-json"),
+		PushRetryCount: c.Int("push-retry-count"),
+		PushRetryDelay: c.String("push-retry-delay"),
+		WithPlainHTTP:  c.Bool("plain-http"),
+	}
+	// Execute reverse conversion
+	err := converter.ReverseConvert(context.Background(), reverseOpt)
+	return true, err
 }

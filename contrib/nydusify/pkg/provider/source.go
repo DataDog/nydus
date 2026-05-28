@@ -18,8 +18,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -72,7 +73,7 @@ func (sp *defaultSourceProvider) Layers(_ context.Context) ([]SourceLayer, error
 	layers := sp.image.Manifest.Layers
 	diffIDs := sp.image.Config.RootFS.DiffIDs
 	if len(layers) != len(diffIDs) {
-		return nil, fmt.Errorf("Mismatched fs layers (%d) and diff ids (%d)", len(layers), len(diffIDs))
+		return nil, fmt.Errorf("mismatched fs layers (%d) and diff ids (%d)", len(layers), len(diffIDs))
 	}
 
 	var parentChainID *digest.Digest
@@ -113,7 +114,7 @@ func (sl *defaultSourceLayer) Mount(ctx context.Context) ([]mount.Mount, func() 
 		}
 
 		return nil
-	}); err != nil {
+	}, 3, 5*time.Second); err != nil {
 		return nil, nil, err
 	}
 

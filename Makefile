@@ -46,10 +46,29 @@ RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
 NYDUSIFY_PATH = contrib/nydusify
 NYDUS-OVERLAYFS_PATH = contrib/nydus-overlayfs
+LLVM_PROFILE_FILE := $(PWD)/coverage/nydus-%p-%m.profraw
+DEBUG_BINARY_DIR := $(PWD)/target/debug/
+GRCOV_ARGS := --binary-path ${DEBUG_BINARY_DIR} -s . \
+	      --branch --ignore-not-existing \
+	      --ignore '*/.rustup/*' --ignore '*/rustup/*' \
+	      --ignore '*/.cargo/*' --ignore '*/cargo/*'
+CARGO_COV_FLAGS :=
+
+# define ENABLE_DEBUG to disable release optimization and trace code coverage
+ifdef ENABLE_DEBUG
+$(eval CARGO_COV_FLAGS += NYDUS_NYDUSD_latest=${DEBUG_BINARY_DIR}/nydusd )
+$(eval CARGO_COV_FLAGS += NYDUS_BUILDER_latest=${DEBUG_BINARY_DIR}/nydus-image )
+$(eval CARGO_COV_FLAGS += RUSTFLAGS='-C instrument-coverage')
+$(eval CARGO_COV_FLAGS += TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) )
+$(eval CARGO_COV_FLAGS += LLVM_PROFILE_FILE=$(LLVM_PROFILE_FILE) )
+else
+$(eval CARGO_BUILD_FLAGS += --release)
+endif
 
 current_dir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 env_go_path := $(shell go env GOPATH 2> /dev/null)
 go_path := $(if $(env_go_path),$(env_go_path),"$(HOME)/go")
+go_work_version := $(shell grep '^go ' go.work | awk '{print $$2}')
 
 # Functions
 
@@ -60,17 +79,15 @@ go_path := $(if $(env_go_path),$(env_go_path),"$(HOME)/go")
 define build_golang
 	echo "Building target $@ by invoking: $(2)"
 	if [ $(DOCKER) = "true" ]; then \
-		docker run --rm -v ${go_path}:/go -v ${current_dir}:/nydus-rs --workdir /nydus-rs/$(1) golang:1.21 $(2) ;\
+		docker run --rm -v ${go_path}:/go -v ${current_dir}:/nydus-rs --workdir /nydus-rs/$(1) golang:${go_work_version} \
+			sh -c "git config --global --add safe.directory /nydus-rs && $(2)" ;\
 	else \
 		$(2) -C $(1); \
 	fi
 endef
 
-.PHONY: .release_version .format .musl_target .clean_libz_sys \
+.PHONY: .format .musl_target .clean_libz_sys \
 	all all-build all-release all-static-release build release static-release
-
-.release_version:
-	$(eval CARGO_BUILD_FLAGS += --release)
 
 .format:
 	${CARGO} fmt -- --check
@@ -83,17 +100,22 @@ endef
 	@${CARGO} clean --target ${RUST_TARGET_STATIC} -p libz-sys
 	@${CARGO} clean --target ${RUST_TARGET_STATIC} --release -p libz-sys
 
+prepare-codecov:
+	${CARGO} install grcov --locked
+	${RUSTUP} component add llvm-tools-preview
+
 # Targets that are exposed to developers and users.
 build: .format
-	${CARGO} build $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) ${CARGO} build $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 	# Cargo will skip checking if it is already checked
 	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --bins --tests -- -Dwarnings --allow clippy::unnecessary_cast --allow clippy::needless_borrow
 
-release: .format .release_version build
+release: .format build
 
-static-release: .clean_libz_sys .musl_target .format .release_version build
+static-release: .clean_libz_sys .musl_target .format build
 
 clean:
+	[ -d coverage ] && rm -rf coverage || true
 	${CARGO} clean
 
 install: release
@@ -103,39 +125,41 @@ install: release
 	@sudo install -m 755 target/release/nydusctl $(INSTALL_DIR_PREFIX)/nydusctl
 
 # unit test
-ut: .release_version
-	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${CARGO} test --no-fail-fast --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) -- --skip integration --nocapture --test-threads=8
+ut:
+	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${CARGO} test --no-fail-fast --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) -- --skip integration --nocapture --test-threads=8
 
 # you need install cargo nextest first from: https://nexte.st/book/pre-built-binaries.html
-ut-nextest: .release_version
-	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'test(test) - test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+ut-nextest:
+	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'test(test) - test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
-# install test dependencies
-pre-coverage:
-	${CARGO} +stable install cargo-llvm-cov --locked
-	${RUSTUP} component add llvm-tools-preview
+# install miri first from https://github.com/rust-lang/miri/
+miri-ut-nextest:
+	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
-# print unit test coverage to console
-coverage: pre-coverage
-	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) ${CARGO} llvm-cov --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) -- --skip integration --nocapture  --test-threads=8
+smoke-only:
+	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test
+
+smoke-performance:
+	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test-performance
+
+smoke-benchmark:
+	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test-benchmark
+
+smoke-takeover:
+	CARGO_COV_FLAGS=$(CARGO_COV_FLAGS) make -C smoke test-takeover
+
+smoke: release smoke-only
+
+generate-codecov-markdown: prepare-codecov
+	grcov $(dir ${LLVM_PROFILE_FILE})/*.profraw -t markdown $(GRCOV_ARGS) --output-path coverage/coverage.md
+
+generate-codecov: prepare-codecov
+	grcov $(dir ${LLVM_PROFILE_FILE})/*.profraw -t lcov $(GRCOV_ARGS) --output-path coverage/coverage.info
 
 # write unit teset coverage to codecov.json, used for Github CI
 coverage-codecov:
 	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) ${RUSTUP} run stable cargo llvm-cov --codecov --output-path codecov.json --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) -- --skip integration --nocapture --test-threads=8
 
-smoke-only:
-	make -C smoke test
-
-smoke-performance:
-	make -C smoke test-performance
-
-smoke-benchmark:
-	make -C smoke test-benchmark
-
-smoke-takeover:
-	make -C smoke test-takeover
-
-smoke: release smoke-only
 
 contrib-build: nydusify nydus-overlayfs
 

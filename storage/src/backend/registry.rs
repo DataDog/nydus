@@ -31,12 +31,10 @@ const REGISTRY_CLIENT_ID: &str = "nydus-registry-client";
 const HEADER_AUTHORIZATION: &str = "Authorization";
 const HEADER_WWW_AUTHENTICATE: &str = "www-authenticate";
 
-const REDIRECTED_STATUS_CODE: [StatusCode; 2] = [
-    StatusCode::MOVED_PERMANENTLY,
-    StatusCode::TEMPORARY_REDIRECT,
-];
-
 const REGISTRY_DEFAULT_TOKEN_EXPIRATION: u64 = 10 * 60; // in seconds
+const REGISTRY_CONFIG_POLL_INTERVAL: u64 = 5; // in seconds
+                                              // Refresh tokens this many seconds before they expire to avoid using an expired token.
+const REGISTRY_TOKEN_REFRESH_MARGIN: u64 = 20; // in seconds
 
 /// Error codes related to registry storage backend operations.
 #[derive(Debug)]
@@ -90,6 +88,12 @@ impl Cache {
             *cached_guard = current;
         }
     }
+}
+
+enum ConfigAuthUpdate {
+    Clear,
+    Basic(String),
+    RefreshBearer(BearerAuth),
 }
 
 #[derive(Default)]
@@ -196,17 +200,17 @@ impl fmt::Display for Scheme {
 }
 
 struct RegistryState {
+    id: String,
     // HTTP scheme like: https, http
     scheme: Scheme,
     host: String,
     // Image repo name like: library/ubuntu
     repo: String,
-    // Base64 encoded registry auth
-    auth: Option<String>,
-    username: String,
-    password: String,
     // Retry limit for read operation
     retry_limit: u8,
+    // When true, skip TLS certificate verification AND allow HTTPS-to-HTTP fallback.
+    // When false (default), TLS errors propagate as-is without falling back to HTTP.
+    skip_verify: bool,
     // Scheme specified for blob server
     blob_url_scheme: String,
     // Replace registry redirected url host with the given host
@@ -217,6 +221,8 @@ struct RegistryState {
     // Example: RwLock<"Bearer <token>">
     //          RwLock<"Basic base64(<username:password>)">
     cached_auth: Cache,
+    // Cache the last registry_auth value observed from the dynamic config API.
+    cached_config_auth: Cache,
     // Cache for the HTTP method when getting auth, it is "true" when using "GET" method.
     // Due to the different implementations of various image registries, auth requests
     // may use the GET or POST methods, we need to cache the method after the
@@ -246,6 +252,9 @@ impl RegistryState {
     }
 
     fn needs_fallback_http(&self, e: &dyn Error) -> bool {
+        if !self.skip_verify {
+            return false;
+        }
         match e.source() {
             Some(err) => match err.source() {
                 Some(err) => {
@@ -257,8 +266,9 @@ impl RegistryState {
                     // we are likely to encounter these types of error:
                     // https://github.com/openssl/openssl/blob/6b3d28757620e0781bb1556032bb6961ee39af63/crypto/err/openssl.txt#L1574
                     // https://github.com/containerd/nerdctl/blob/225a70bdc3b93cdb00efac7db1ceb50c098a8a16/pkg/cmd/image/push.go#LL135C66-L135C66
-                    let fallback =
-                        msg.contains("wrong version number") || msg.contains("connection refused");
+                    let fallback = msg.contains("wrong version number")
+                        || msg.contains("connection refused")
+                        || msg.to_lowercase().contains("ssl");
                     if fallback {
                         warn!("fallback to http due to tls connection error: {}", err);
                     }
@@ -270,6 +280,82 @@ impl RegistryState {
         }
     }
 
+    fn get_config_auth(&self) -> String {
+        nydus_utils::config::get(&self.id, &nydus_utils::config::Keys::RegistryAuth)
+    }
+
+    fn set_config_auth(&self, auth: Option<String>) {
+        if let Some(auth) = auth {
+            nydus_utils::config::set(
+                &self.id,
+                &nydus_utils::config::Keys::RegistryAuth,
+                auth.clone(),
+            );
+        }
+    }
+
+    fn clear_cached_auth(&self) {
+        let last_cached_auth = self.cached_auth.get();
+        self.cached_auth.set(&last_cached_auth, String::new());
+        self.token_expired_at.store(None);
+    }
+
+    fn detect_config_auth_update(&self) -> Option<ConfigAuthUpdate> {
+        let last_config_auth = self.cached_config_auth.get();
+        let (config_auth, changed) = nydus_utils::config::get_changed(
+            &self.id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            &last_config_auth,
+        );
+        if !changed {
+            return None;
+        }
+
+        self.cached_config_auth
+            .set(&last_config_auth, config_auth.clone());
+
+        if config_auth.is_empty() {
+            return Some(ConfigAuthUpdate::Clear);
+        }
+
+        if let Some(cached_bearer_auth) = self.cached_bearer_auth.load().as_deref() {
+            return Some(ConfigAuthUpdate::RefreshBearer(
+                cached_bearer_auth.to_owned(),
+            ));
+        }
+
+        Some(ConfigAuthUpdate::Basic(config_auth))
+    }
+
+    fn refresh_cached_auth_from_config(&self, connection: &Arc<Connection>) {
+        match self.detect_config_auth_update() {
+            None => {}
+            Some(ConfigAuthUpdate::Clear) => self.clear_cached_auth(),
+            Some(ConfigAuthUpdate::Basic(config_auth)) => {
+                let last_cached_auth = self.cached_auth.get();
+                self.cached_auth
+                    .set(&last_cached_auth, format!("Basic {}", config_auth));
+                self.token_expired_at.store(None);
+                debug!("refreshed basic registry auth after registry_auth config update");
+            }
+            Some(ConfigAuthUpdate::RefreshBearer(auth)) => match self.get_token(auth, connection) {
+                Ok(token) => {
+                    let last_cached_auth = self.cached_auth.get();
+                    self.cached_auth
+                        .set(&last_cached_auth, format!("Bearer {}", token.token));
+                    debug!("refreshed bearer registry token after registry_auth config update");
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to refresh registry token after registry_auth config update: {}",
+                        err
+                    );
+                    self.clear_cached_auth();
+                }
+            },
+        }
+    }
+
     // Request registry authentication server to get bearer token
     fn get_token(&self, auth: BearerAuth, connection: &Arc<Connection>) -> Result<TokenResponse> {
         let http_get = self
@@ -277,13 +363,13 @@ impl RegistryState {
             .get(&self.host)
             .unwrap_or_default();
         let resp = if http_get {
-            self.get_token_with_get(&auth, connection)?
+            self.fetch_token(&auth, connection, Method::GET)?
         } else {
-            match self.get_token_with_post(&auth, connection) {
+            match self.fetch_token(&auth, connection, Method::POST) {
                 Ok(resp) => resp,
                 Err(_) => {
                     warn!("retry http GET method to get auth token");
-                    let resp = self.get_token_with_get(&auth, connection)?;
+                    let resp = self.fetch_token(&auth, connection, Method::GET)?;
                     // Cache http method for next use.
                     self.cached_auth_using_http_get.set(self.host.clone(), true);
                     resp
@@ -309,80 +395,60 @@ impl RegistryState {
         Ok(ret)
     }
 
-    // Get bearer token using a POST request
-    fn get_token_with_post(
+    // Fetches a bearer token from the registry's authentication
+    fn fetch_token(
         &self,
         auth: &BearerAuth,
         connection: &Arc<Connection>,
+        method: Method,
     ) -> Result<Response> {
-        let mut form = HashMap::new();
-        form.insert("service".to_string(), auth.service.clone());
-        form.insert("scope".to_string(), auth.scope.clone());
-        form.insert("grant_type".to_string(), "password".to_string());
-        form.insert("username".to_string(), self.username.clone());
-        form.insert("password".to_string(), self.password.clone());
-        form.insert("client_id".to_string(), REGISTRY_CLIENT_ID.to_string());
-
-        let token_resp = connection
-            .call::<&[u8]>(
-                Method::POST,
-                auth.realm.as_str(),
-                None,
-                Some(ReqBody::Form(form)),
-                &mut HeaderMap::new(),
-                true,
-            )
-            .map_err(|e| {
-                warn!(
-                    "failed to request registry auth server by POST method: {:?}",
-                    e
-                );
-                einval!()
-            })?;
-
-        Ok(token_resp)
-    }
-
-    // Get bearer token using a GET request
-    fn get_token_with_get(
-        &self,
-        auth: &BearerAuth,
-        connection: &Arc<Connection>,
-    ) -> Result<Response> {
-        let query = [
-            ("service", auth.service.as_str()),
-            ("scope", auth.scope.as_str()),
-            ("grant_type", "password"),
-            ("username", self.username.as_str()),
-            ("password", self.password.as_str()),
-            ("client_id", REGISTRY_CLIENT_ID),
-        ];
-
         let mut headers = HeaderMap::new();
 
-        // Insert the basic auth header to ensure the compatibility (e.g. Harbor registry)
-        // of fetching token by HTTP GET method.
-        // This refers containerd implementation: https://github.com/containerd/containerd/blob/dc7dba9c20f7210c38e8255487fc0ee12692149d/remotes/docker/auth/fetch.go#L187
-        if let Some(auth) = &self.auth {
+        let config_auth = self.get_config_auth();
+        if !config_auth.is_empty() {
             headers.insert(
                 HEADER_AUTHORIZATION,
-                format!("Basic {}", auth).parse().unwrap(),
+                format!("Basic {}", config_auth).parse().unwrap(),
             );
+        }
+
+        let mut query: Option<&[(&str, &str)]> = None;
+        let mut body = None;
+
+        let query_params_get;
+
+        match method {
+            Method::GET => {
+                query_params_get = [
+                    ("service", auth.service.as_str()),
+                    ("scope", auth.scope.as_str()),
+                    ("client_id", REGISTRY_CLIENT_ID),
+                ];
+                query = Some(&query_params_get);
+            }
+            Method::POST => {
+                let mut form = HashMap::new();
+                form.insert("service".to_string(), auth.service.clone());
+                form.insert("scope".to_string(), auth.scope.clone());
+                form.insert("client_id".to_string(), REGISTRY_CLIENT_ID.to_string());
+                body = Some(ReqBody::Form(form));
+            }
+            _ => return Err(einval!()),
         }
 
         let token_resp = connection
             .call::<&[u8]>(
-                Method::GET,
+                method.clone(),
                 auth.realm.as_str(),
-                Some(&query),
-                None,
+                query,
+                body,
                 &mut headers,
                 true,
             )
-            .map_err(|e| {
+            .map_err(move |e| {
                 warn!(
-                    "failed to request registry auth server by GET method: {:?}",
-                    e
+                    "failed to request registry auth server by {:?} method: {:?}",
+                    method, e
                 );
                 einval!()
             })?;
@@ -392,11 +458,7 @@ impl RegistryState {
 
     fn get_auth_header(&self, auth: Auth, connection: &Arc<Connection>) -> Result<String> {
         match auth {
-            Auth::Basic(_) => self
-                .auth
-                .as_ref()
-                .map(|auth| format!("Basic {}", auth))
-                .ok_or_else(|| einval!("invalid auth config")),
+            Auth::Basic(_) => Ok(format!("Basic {}", self.get_config_auth())),
             Auth::Bearer(auth) => {
                 let token = self.get_token(auth, connection)?;
                 Ok(format!("Bearer {}", token.token))
@@ -727,9 +789,11 @@ impl RegistryReader {
                 }
             };
             let status = resp.status();
+            let need_redirect =
+                status >= StatusCode::MULTIPLE_CHOICES && status < StatusCode::BAD_REQUEST;
 
             // Handle redirect request and cache redirect url
-            if REDIRECTED_STATUS_CODE.contains(&status) {
+            if need_redirect {
                 if let Some(location) = resp.headers().get("location") {
                     let location = location.to_str().unwrap();
                     let mut location = Url::parse(location)
@@ -864,7 +928,7 @@ pub struct Registry {
 impl Registry {
     #[allow(clippy::useless_let_if_seq)]
     pub fn new(config: &RegistryConfig, id: Option<&str>) -> Result<Registry> {
-        let id = id.ok_or_else(|| einval!("Registry backend requires blob_id"))?;
+        let id = id.ok_or_else(|| einval!("Registry backend requires id"))?;
         let con_config: ConnectionConfig = config.clone().into();
 
         if !config.proxy.url.is_empty() && !config.mirrors.is_empty() {
@@ -877,7 +941,7 @@ impl Registry {
         let connection = Connection::new(&con_config)?;
         let auth = trim(config.auth.clone());
         let registry_token = trim(config.registry_token.clone());
-        let (username, password) = Self::get_authorization_info(&auth)?;
+        Self::validate_authorization_info(&auth)?;
         let cached_auth = if let Some(registry_token) = registry_token {
             // Store the registry bearer token to cached_auth, prefer to
             // use the token stored in cached_auth to request registry.
@@ -893,14 +957,14 @@ impl Registry {
         };
 
         let state = Arc::new(RegistryState {
+            id: id.to_owned(),
             scheme,
             host: config.host.clone(),
             repo: config.repo.clone(),
-            auth,
             cached_auth,
-            username,
-            password,
+            cached_config_auth: Cache::new(auth.clone().unwrap_or_default()),
             retry_limit,
+            skip_verify: config.skip_verify,
             blob_url_scheme: config.blob_url_scheme.clone(),
             blob_redirected_host: config.blob_redirected_host.clone(),
             cached_auth_using_http_get: HashCache::new(),
@@ -908,6 +972,7 @@ impl Registry {
             token_expired_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         });
+        state.set_config_auth(auth);
 
         let registry = Registry {
             connection,
@@ -922,7 +987,7 @@ impl Registry {
         Ok(registry)
     }
 
-    fn get_authorization_info(auth: &Option<String>) -> Result<(String, String)> {
+    fn validate_authorization_info(auth: &Option<String>) -> Result<()> {
         if let Some(auth) = &auth {
             let auth: Vec<u8> = base64::engine::general_purpose::STANDARD
                 .decode(auth.as_bytes())
@@ -942,25 +1007,24 @@ impl Registry {
             if auth.len() < 2 {
                 return Err(einval!("Invalid registry auth config"));
             }
-
-            Ok((auth[0].to_string(), auth[1].to_string()))
-        } else {
-            Ok((String::new(), String::new()))
         }
+        Ok(())
     }
 
     fn start_refresh_token_thread(&self) {
         let conn = self.connection.clone();
         let state = self.state.clone();
-        // FIXME: we'd better allow users to specify the expiration time.
-        let mut refresh_interval = REGISTRY_DEFAULT_TOKEN_EXPIRATION;
         thread::spawn(move || {
             loop {
+                // Check for config auth changes every tick.
+                state.refresh_cached_auth_from_config(&conn);
+
                 if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     if let Some(token_expired_at) = state.token_expired_at.load().as_deref() {
-                        // If the token will expire within the next refresh interval,
-                        // refresh it immediately.
-                        if now_timestamp.as_secs() + refresh_interval >= *token_expired_at {
+                        // Refresh the token if it will expire within the margin.
+                        if now_timestamp.as_secs() + REGISTRY_TOKEN_REFRESH_MARGIN
+                            >= *token_expired_at
+                        {
                             if let Some(cached_bearer_auth) =
                                 state.cached_bearer_auth.load().as_deref()
                             {
@@ -971,16 +1035,9 @@ impl Registry {
                                     debug!(
                                         "[refresh_token_thread] registry token has been refreshed"
                                     );
-                                    // Refresh cached token.
                                     state
                                         .cached_auth
                                         .set(&state.cached_auth.get(), new_cached_auth);
-                                    // Reset refresh interval according to real expiration time,
-                                    // and advance 20s to handle the unexpected cases.
-                                    refresh_interval = token
-                                        .expires_in
-                                        .checked_sub(20)
-                                        .unwrap_or(token.expires_in);
                                 } else {
                                     error!(
                                         "[refresh_token_thread] failed to refresh registry token"
@@ -994,7 +1051,7 @@ impl Registry {
                 if conn.shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                thread::sleep(Duration::from_secs(refresh_interval));
+                thread::sleep(Duration::from_secs(REGISTRY_CONFIG_POLL_INTERVAL));
                 if conn.shutdown.load(Ordering::Acquire) {
                     break;
                 }
@@ -1047,8 +1104,65 @@ fn trim(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::response;
     use serde_json::json;
+    use std::error::Error as StdError;
+    use std::fmt::{Display, Formatter};
+
+    #[cfg(feature = "backend-registry")]
+    use http;
+
+    #[derive(Debug)]
+    struct NestedErr {
+        msg: &'static str,
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    }
+
+    impl Display for NestedErr {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl StdError for NestedErr {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_ref()
+                .map(|source| &**source as &(dyn StdError + 'static))
+        }
+    }
+
+    fn create_state(use_https: bool) -> RegistryState {
+        create_state_with_skip_verify(use_https, false)
+    }
+
+    fn create_state_with_skip_verify(use_https: bool, skip_verify: bool) -> RegistryState {
+        RegistryState {
+            id: String::from("/"),
+            scheme: Scheme::new(use_https),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(None),
+        }
+    }
+
+    fn nested_error(msg: &'static str) -> NestedErr {
+        NestedErr {
+            msg: "outer",
+            source: Some(Box::new(NestedErr {
+                msg: "middle",
+                source: Some(Box::new(NestedErr { msg, source: None })),
+            })),
+        }
+    }
 
     #[test]
     fn test_string_cache() {
@@ -1076,19 +1190,142 @@ mod tests {
     }
 
     #[test]
+    fn test_no_fallback_http_by_default() {
+        // With skip_verify=false (default), never fall back to http.
+        let state = create_state(true);
+        assert_eq!(state.scheme.to_string(), "https");
+        assert!(!state.needs_fallback_http(&nested_error("wrong version number")));
+        assert!(!state.needs_fallback_http(&nested_error("SSL routines")));
+    }
+
+    #[test]
+    fn test_scheme_and_fallback_http() {
+        // With skip_verify=true and https, TLS errors trigger fallback.
+        let state = create_state_with_skip_verify(true, true);
+        assert_eq!(state.scheme.to_string(), "https");
+        assert!(state.needs_fallback_http(&nested_error("wrong version number")));
+        assert!(state.needs_fallback_http(&nested_error("SSL routines")));
+        assert!(!state.needs_fallback_http(&nested_error("permission denied")));
+
+        // With skip_verify=true and http, no fallback needed (already http).
+        let state = create_state_with_skip_verify(false, true);
+        assert_eq!(state.scheme.to_string(), "http");
+        assert!(!state.needs_fallback_http(&nested_error("wrong version number")));
+    }
+
+    #[test]
+    fn test_validate_authorization_info() {
+        assert!(Registry::validate_authorization_info(&None).is_ok());
+
+        let valid = Some(base64::engine::general_purpose::STANDARD.encode("user:pass"));
+        assert!(Registry::validate_authorization_info(&valid).is_ok());
+
+        let invalid_base64 = Some("%%%".to_string());
+        assert!(Registry::validate_authorization_info(&invalid_base64).is_err());
+
+        let invalid_utf8 = Some(base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe]));
+        assert!(Registry::validate_authorization_info(&invalid_utf8).is_err());
+
+        let missing_colon = Some(base64::engine::general_purpose::STANDARD.encode("useronly"));
+        assert!(Registry::validate_authorization_info(&missing_colon).is_err());
+    }
+
+    #[test]
+    fn test_detect_config_auth_update_basic() {
+        let id = "/test-detect-config-auth-update-basic";
+        let state = RegistryState {
+            id: id.to_string(),
+            scheme: Scheme::new(true),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify: false,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(None),
+        };
+
+        nydus_utils::config::set(
+            id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            "dGVzdDp0ZXN0".to_string(),
+        );
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::Basic(auth)) => assert_eq!(auth, "dGVzdDp0ZXN0"),
+            _ => panic!("unexpected config auth update result"),
+        }
+        assert!(state.detect_config_auth_update().is_none());
+
+        nydus_utils::config::remove(id, &nydus_utils::config::Keys::RegistryAuth);
+    }
+
+    #[test]
+    fn test_detect_config_auth_update_clear_and_refresh_bearer() {
+        let id = "/test-detect-config-auth-update-refresh-bearer";
+        let state = RegistryState {
+            id: id.to_string(),
+            scheme: Scheme::new(true),
+            host: "example.com".to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 5,
+            skip_verify: false,
+            blob_url_scheme: "https".to_string(),
+            blob_redirected_host: "blob.example.com".to_string(),
+            cached_auth_using_http_get: Default::default(),
+            cached_auth: Default::default(),
+            cached_config_auth: Cache::new("old-auth".to_string()),
+            cached_redirect: Default::default(),
+            token_expired_at: ArcSwapOption::new(None),
+            cached_bearer_auth: ArcSwapOption::new(Some(Arc::new(BearerAuth {
+                realm: "https://auth.example.com/token".to_string(),
+                service: "example.com".to_string(),
+                scope: "repository:library/test:pull".to_string(),
+            }))),
+        };
+
+        nydus_utils::config::set(
+            id,
+            &nydus_utils::config::Keys::RegistryAuth,
+            "bmV3LWF1dGg=".to_string(),
+        );
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::RefreshBearer(auth)) => {
+                assert_eq!(auth.realm, "https://auth.example.com/token");
+                assert_eq!(auth.service, "example.com");
+                assert_eq!(auth.scope, "repository:library/test:pull");
+            }
+            _ => panic!("unexpected config auth update result"),
+        }
+
+        nydus_utils::config::remove(id, &nydus_utils::config::Keys::RegistryAuth);
+
+        match state.detect_config_auth_update() {
+            Some(ConfigAuthUpdate::Clear) => {}
+            _ => panic!("unexpected config auth clear result"),
+        }
+    }
+
+    #[test]
     fn test_state_url() {
         let state = RegistryState {
+            id: String::from("/"),
             scheme: Scheme::new(false),
             host: "alibaba-inc.com".to_string(),
             repo: "nydus".to_string(),
-            auth: None,
-            username: "test".to_string(),
-            password: "password".to_string(),
             retry_limit: 5,
+            skip_verify: false,
             blob_url_scheme: "https".to_string(),
             blob_redirected_host: "oss.alibaba-inc.com".to_string(),
             cached_auth_using_http_get: Default::default(),
             cached_auth: Default::default(),
+            cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
@@ -1142,6 +1379,29 @@ mod tests {
         let str = "Base realm=\"https://auth.my-registry.com/token\"";
         let header = HeaderValue::from_str(str).unwrap();
         assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("Basic realm");
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("");
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static(
+            "Bearer realm=\"https://auth.my-registry.com/token\",scope=\"repository:test/repo:pull\"",
+        );
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static(
+            "Bearer service=\"my-registry.com\",scope=\"repository:test/repo:pull\"",
+        );
+        assert!(RegistryState::parse_auth(&header).is_none());
+
+        let header = HeaderValue::from_static("Basic realm=\"harbor\"");
+        let auth = RegistryState::parse_auth(&header).unwrap();
+        match auth {
+            Auth::Basic(auth) => assert_eq!(&auth.realm, "harbor"),
+            _ => panic!("failed to parse `Basic` authentication header with explicit realm"),
+        }
     }
 
     #[test]
@@ -1219,8 +1479,8 @@ mod tests {
             "token": "test_token_value",
             "expires_in": 3600
         });
-        let response = Response::from(
-            response::Builder::new()
+        let response = reqwest::blocking::Response::from(
+            http::response::Builder::new()
                 .body(json_with_token.to_string())
                 .unwrap(),
         );
@@ -1233,8 +1493,8 @@ mod tests {
             "access_token": "test_access_token_value",
             "expires_in": 7200
         });
-        let response = Response::from(
-            response::Builder::new()
+        let response = reqwest::blocking::Response::from(
+            http::response::Builder::new()
                 .body(json_with_access_token.to_string())
                 .unwrap(),
         );
@@ -1246,8 +1506,8 @@ mod tests {
         let json_with_default_expiration = json!({
             "token": "default_expiration_token"
         });
-        let response = Response::from(
-            response::Builder::new()
+        let response = reqwest::blocking::Response::from(
+            http::response::Builder::new()
                 .body(json_with_default_expiration.to_string())
                 .unwrap(),
         );
@@ -1260,8 +1520,8 @@ mod tests {
             "token": "test_token_value",
             "access_token": "test_access_token_value",
         });
-        let response = Response::from(
-            response::Builder::new()
+        let response = reqwest::blocking::Response::from(
+            http::response::Builder::new()
                 .body(json_with_both_tokens.to_string())
                 .unwrap(),
         );
@@ -1270,8 +1530,8 @@ mod tests {
 
         // Case 5: Response contains no token
         let json_with_no_token = json!({});
-        let response = Response::from(
-            response::Builder::new()
+        let response = reqwest::blocking::Response::from(
+            http::response::Builder::new()
                 .body(json_with_no_token.to_string())
                 .unwrap(),
         );

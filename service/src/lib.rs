@@ -6,7 +6,7 @@
 //!
 //! The `nydus-service` crate provides facilities to manage Nydus services, such as:
 //! - `blobfs`: share processed RAFS metadata/data blobs to guest by virtio-fs, so the RAFS
-//!    filesystem can be mounted by EROFS inside guest.
+//!   filesystem can be mounted by EROFS inside guest.
 //! - `blockdev`: compose processed RAFS metadata/data as a block device, so it can be used as
 //!   backend for virtio-blk.
 //! - `fscache`: cooperate Linux fscache subsystem to mount RAFS filesystems by EROFS.
@@ -106,6 +106,10 @@ pub enum Error {
     // Fuse session has been shutdown.
     #[error("FUSE session has been shut down, {0}")]
     SessionShutdown(FuseTransportError),
+    #[error("FUSE notify error, {0}")]
+    NotifyError(#[from] FuseNotifyError),
+    #[error("failed to walk and notify invalidation: {0}")]
+    WalkNotifyInvalidation(#[from] std::io::Error),
 
     // virtio-fs
     #[error("failed to handle event other than input event")]
@@ -115,7 +119,7 @@ pub enum Error {
     #[error("fail to walk descriptor chain")]
     IterateQueue,
     #[error("invalid Virtio descriptor chain, {0}")]
-    InvalidDescriptorChain(#[from] FuseTransportError),
+    InvalidDescriptorChain(FuseTransportError),
     #[error("failed to process FUSE request, {0}")]
     ProcessQueue(#[from] FuseError),
     #[error("failed to create epoll context, {0}")]
@@ -148,6 +152,18 @@ impl From<Error> for DaemonErrorKind {
 
 /// Specialized `Result` for Nydus library.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum FuseNotifyError {
+    #[error("Session failure error, {0}")]
+    SessionFailure(#[from] FuseTransportError),
+    #[error("Fuse write error, {0}")]
+    FuseWriteError(#[source] FuseError),
+    #[error("Sysfs file open error, {0}")]
+    SysfsOpenError(#[source] io::Error),
+    #[error("Sysfs write error, {0}")]
+    SysfsWriteError(#[source] io::Error),
+}
 
 /// Type of supported backend filesystems.
 #[derive(Clone, Debug, Serialize, PartialEq, Deserialize, Versionize)]
@@ -282,6 +298,17 @@ mod tests {
     }
 
     #[test]
+    fn test_backend_fs_type_invalid_inputs() {
+        let err = FsBackendType::from_str("").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only 'rafs' and 'passthrough_fs' are supported"));
+
+        let err = FsBackendType::from_str("Rafs").unwrap_err();
+        assert!(err.to_string().contains("Rafs was specified"));
+    }
+
+    #[test]
     fn test_validate_thread_configuration() {
         assert_eq!(validate_threads_configuration("1").unwrap(), 1);
         assert_eq!(validate_threads_configuration("1024").unwrap(), 1024);
@@ -290,5 +317,83 @@ mod tests {
         assert!(validate_threads_configuration("1.0").is_err());
         assert!(validate_threads_configuration("1025").is_err());
         assert!(validate_threads_configuration("test").is_err());
+    }
+
+    #[test]
+    fn test_error_into_io_error() {
+        let e = Error::NotFound;
+        let io_err: std::io::Error = e.into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let e = Error::InvalidArguments("bad arg".into());
+        let io_err: std::io::Error = e.into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_error_to_daemon_error_kind() {
+        use nydus_api::DaemonErrorKind;
+
+        // NotReady branch
+        let kind = DaemonErrorKind::from(Error::NotReady);
+        assert!(matches!(kind, DaemonErrorKind::NotReady));
+
+        // Unsupported branch
+        let kind = DaemonErrorKind::from(Error::Unsupported);
+        assert!(matches!(kind, DaemonErrorKind::Unsupported));
+
+        // UpgradeManager branch
+        let kind = DaemonErrorKind::from(Error::UpgradeManager(
+            upgrade::UpgradeMgrError::MissingSupervisorPath,
+        ));
+        assert!(matches!(kind, DaemonErrorKind::UpgradeManager(_)));
+
+        // Serde branch
+        let serde_err = serde_json::from_str::<i32>("invalid_json").unwrap_err();
+        let kind = DaemonErrorKind::from(Error::Serde(serde_err));
+        assert!(matches!(kind, DaemonErrorKind::Serde(_)));
+
+        // UnexpectedEvent branch
+        use crate::daemon::DaemonStateMachineInput;
+        let kind = DaemonErrorKind::from(Error::UnexpectedEvent(DaemonStateMachineInput::Start));
+        assert!(matches!(kind, DaemonErrorKind::UnexpectedEvent(_)));
+
+        // Other (catch-all) branch
+        let kind = DaemonErrorKind::from(Error::AlreadyExists);
+        assert!(matches!(kind, DaemonErrorKind::Other(_)));
+        let kind = DaemonErrorKind::from(Error::NotFound);
+        assert!(matches!(kind, DaemonErrorKind::Other(_)));
+    }
+
+    #[test]
+    fn test_fuse_notify_error_display() {
+        let e = FuseNotifyError::SysfsOpenError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no file",
+        ));
+        assert!(e.to_string().contains("Sysfs file open error"));
+
+        let e = FuseNotifyError::SysfsWriteError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert!(e.to_string().contains("Sysfs write error"));
+    }
+
+    #[test]
+    fn test_error_display_variants() {
+        assert!(Error::AlreadyExists.to_string().contains("already exists"));
+        assert!(Error::NotFound.to_string().contains("doesn't exist"));
+        assert!(Error::NotReady.to_string().contains("not ready"));
+        assert!(Error::Unsupported.to_string().contains("unsupported"));
+        assert!(Error::InvalidPrefetchList
+            .to_string()
+            .contains("prefetch file list"));
+        assert!(Error::InvalidConfig("cfg".into())
+            .to_string()
+            .contains("cfg"));
+        assert!(Error::InvalidArguments("arg".into())
+            .to_string()
+            .contains("arg"));
     }
 }

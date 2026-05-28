@@ -15,53 +15,72 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/archive/compression"
+	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 	"github.com/goharbor/acceleration-service/pkg/cache"
 	accelcontent "github.com/goharbor/acceleration-service/pkg/content"
 	"github.com/goharbor/acceleration-service/pkg/remote"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 var LayerConcurrentLimit = 5
 
 type Provider struct {
-	mutex        sync.Mutex
-	usePlainHTTP bool
-	images       map[string]*ocispec.Descriptor
-	store        content.Store
-	hosts        remote.HostFunc
-	platformMC   platforms.MatchComparer
-	cacheSize    int
-	cacheVersion string
-	chunkSize    int64
+	mutex          sync.Mutex
+	usePlainHTTP   bool
+	images         map[string]*ocispec.Descriptor
+	store          content.Store
+	hosts          remote.HostFunc
+	platformMC     platforms.MatchComparer
+	cacheSize      int
+	cacheVersion   string
+	chunkSize      int64
+	pushRetryCount int
+	pushRetryDelay time.Duration
+	localSource    string
+	localTarget    string
 }
 
-func New(root string, hosts remote.HostFunc, cacheSize uint, cacheVersion string, platformMC platforms.MatchComparer, chunkSize int64) (*Provider, error) {
+// New creates a Provider with optional custom content.Store override.
+// If storeOverride is nil, defaults to using accelcontent.NewContent.
+func New(root string, hosts remote.HostFunc, cacheSize uint, cacheVersion string, platformMC platforms.MatchComparer, chunkSize int64, storeOverride content.Store) (*Provider, error) {
 	contentDir := filepath.Join(root, "content")
 	if err := os.MkdirAll(contentDir, 0755); err != nil {
 		return nil, err
 	}
-	store, err := accelcontent.NewContent(hosts, contentDir, root, "0MB")
-	if err != nil {
-		return nil, err
+
+	var store content.Store
+	var err error
+	if storeOverride != nil {
+		store = storeOverride
+	} else {
+		store, err = accelcontent.NewContent(hosts, contentDir, root, "0MB")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &Provider{
-		images:       make(map[string]*ocispec.Descriptor),
-		store:        store,
-		hosts:        hosts,
-		cacheSize:    int(cacheSize),
-		platformMC:   platformMC,
-		cacheVersion: cacheVersion,
-		chunkSize:    chunkSize,
+		images:         make(map[string]*ocispec.Descriptor),
+		store:          store,
+		hosts:          hosts,
+		cacheSize:      int(cacheSize),
+		platformMC:     platformMC,
+		cacheVersion:   cacheVersion,
+		chunkSize:      chunkSize,
+		pushRetryCount: 3,
+		pushRetryDelay: 5 * time.Second,
 	}, nil
 }
 
@@ -119,20 +138,23 @@ func (pvd *Provider) Resolver(ref string) (remotes.Resolver, error) {
 	return newResolver(insecure, pvd.usePlainHTTP, credFunc, pvd.chunkSize), nil
 }
 
+// Implements the acceleration service Provider Pull
+// Will pull image from remote registry or import from local tar file based on configuration
 func (pvd *Provider) Pull(ctx context.Context, ref string) error {
-	resolver, err := pvd.Resolver(ref)
-	if err != nil {
-		return err
-	}
-	rc := &containerd.RemoteContext{
-		Resolver:               resolver,
-		PlatformMatcher:        pvd.platformMC,
-		MaxConcurrentDownloads: LayerConcurrentLimit,
-	}
-
-	img, err := fetch(ctx, pvd.store, rc, ref, 0)
-	if err != nil {
-		return err
+	var (
+		img images.Image
+		err error
+	)
+	if pvd.localSource != "" {
+		logrus.Infof("importing source image from %s", pvd.localSource)
+		if img, err = pvd.localPull(ctx, pvd.localSource); err != nil {
+			return err
+		}
+	} else {
+		logrus.Infof("pulling source image from %s", ref)
+		if img, err = pvd.remotePull(ctx, ref); err != nil {
+			return err
+		}
 	}
 
 	pvd.mutex.Lock()
@@ -142,21 +164,91 @@ func (pvd *Provider) Pull(ctx context.Context, ref string) error {
 	return nil
 }
 
+func (pvd *Provider) localPull(ctx context.Context, path string) (images.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return images.Image{}, err
+	}
+	defer f.Close()
+
+	ds, err := compression.DecompressStream(f)
+	if err != nil {
+		return images.Image{}, err
+	}
+	defer ds.Close()
+
+	img, err := pvd.Import(ctx, ds)
+	return img, err
+}
+
+func (pvd *Provider) remotePull(ctx context.Context, ref string) (images.Image, error) {
+	resolver, err := pvd.Resolver(ref)
+	if err != nil {
+		return images.Image{}, err
+	}
+	rc := &client.RemoteContext{
+		Resolver:               resolver,
+		PlatformMatcher:        pvd.platformMC,
+		MaxConcurrentDownloads: LayerConcurrentLimit,
+	}
+
+	img, err := fetch(ctx, pvd.store, rc, ref, 0)
+	return img, err
+}
+
+// SetPushRetryConfig sets the retry configuration for push operations
+func (pvd *Provider) SetPushRetryConfig(count int, delay time.Duration) {
+	pvd.mutex.Lock()
+	defer pvd.mutex.Unlock()
+	pvd.pushRetryCount = count
+	pvd.pushRetryDelay = delay
+}
+
+// Implements the acceleration service Provider Push
+// Will push image to remote registry or export to local tar file based on configuration
 func (pvd *Provider) Push(ctx context.Context, desc ocispec.Descriptor, ref string) error {
+	if pvd.localTarget != "" {
+		logrus.Infof("exporting target image to %s", pvd.localTarget)
+		return pvd.localPush(ctx, desc, ref, pvd.localTarget)
+	}
+	logrus.Infof("pushing target image to %s", ref)
+	return pvd.remotePush(ctx, desc, ref)
+}
+
+func (pvd *Provider) localPush(ctx context.Context, desc ocispec.Descriptor, ref string, path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := pvd.Export(ctx, f, &desc, ref); err != nil {
+		return errors.Wrap(err, "export target image to target tar file")
+	}
+	return nil
+}
+
+func (pvd *Provider) remotePush(ctx context.Context, desc ocispec.Descriptor, ref string) error {
 	resolver, err := pvd.Resolver(ref)
 	if err != nil {
 		return err
 	}
-	rc := &containerd.RemoteContext{
+	rc := &client.RemoteContext{
 		Resolver:                    resolver,
 		PlatformMatcher:             pvd.platformMC,
 		MaxConcurrentUploadedLayers: LayerConcurrentLimit,
 	}
 
-	return push(ctx, pvd.store, rc, desc, ref)
+	err = utils.WithRetry(func() error {
+		return push(ctx, pvd.store, rc, desc, ref)
+	}, pvd.pushRetryCount, pvd.pushRetryDelay)
+
+	if err != nil {
+		logrus.WithError(err).Error("Push failed after all attempts")
+	}
+	return err
 }
 
-func (pvd *Provider) Import(ctx context.Context, reader io.Reader) (string, error) {
+func (pvd *Provider) Import(ctx context.Context, reader io.Reader) (images.Image, error) {
 	iopts := importOpts{
 		dgstRefT: func(dgst digest.Digest) string {
 			return "nydus" + "@" + dgst.String()
@@ -164,21 +256,21 @@ func (pvd *Provider) Import(ctx context.Context, reader io.Reader) (string, erro
 		skipDgstRef:     func(name string) bool { return name != "" },
 		platformMatcher: pvd.platformMC,
 	}
-	images, err := load(ctx, reader, pvd.store, iopts)
+	imgs, err := load(ctx, reader, pvd.store, iopts)
 	if err != nil {
-		return "", err
+		return images.Image{}, err
 	}
 
-	if len(images) != 1 {
-		return "", errors.New("incorrect tarball format")
+	if len(imgs) != 1 {
+		return images.Image{}, errors.New("incorrect tarball format")
 	}
-	image := images[0]
+	image := imgs[0]
 
 	pvd.mutex.Lock()
 	defer pvd.mutex.Unlock()
 	pvd.images[image.Name] = &image.Target
 
-	return image.Name, nil
+	return image, nil
 }
 
 func (pvd *Provider) Export(ctx context.Context, writer io.Writer, img *ocispec.Descriptor, name string) error {
@@ -208,4 +300,12 @@ func (pvd *Provider) NewRemoteCache(ctx context.Context, ref string) (context.Co
 		return cache.New(ctx, ref, "", pvd.cacheSize, pvd)
 	}
 	return ctx, nil
+}
+
+func (pvd *Provider) WithLocalSource(path string) {
+	pvd.localSource = path
+}
+
+func (pvd *Provider) WithLocalTarget(path string) {
+	pvd.localTarget = path
 }

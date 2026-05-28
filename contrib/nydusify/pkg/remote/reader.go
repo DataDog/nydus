@@ -8,9 +8,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes"
-	"github.com/distribution/reference"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -58,7 +57,7 @@ func (ra *readerAt) ReadAt(p []byte, off int64) (int, error) {
 
 	var totalN int
 	for len(p) > 0 {
-		n, err := ra.Reader.Read(p)
+		n, err := ra.Read(p)
 		if err == io.EOF && n == len(p) {
 			err = nil
 		}
@@ -80,11 +79,9 @@ func (ra *readerAt) Size() int64 {
 // ReaderAt returns a content.ReaderAt for reading remote blobs
 // It creates a new resolver instance for each request to ensure thread safety
 func (remote *Remote) ReaderAt(ctx context.Context, desc ocispec.Descriptor, byDigest bool) (content.ReaderAt, error) {
-	var ref string
-	if byDigest {
-		ref = remote.parsed.Name()
-	} else {
-		ref = reference.TagNameOnly(remote.parsed).String()
+	ref, err := remote.requestRef(byDigest)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create a new resolver instance for the request
@@ -99,11 +96,9 @@ func (remote *Remote) ReaderAt(ctx context.Context, desc ocispec.Descriptor, byD
 }
 
 func (remote *Remote) ReadSeekCloser(ctx context.Context, desc ocispec.Descriptor, byDigest bool) (io.ReadSeekCloser, error) {
-	var ref string
-	if byDigest {
-		ref = remote.parsed.Name()
-	} else {
-		ref = reference.TagNameOnly(remote.parsed).String()
+	ref, err := remote.requestRef(byDigest)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create a new resolver instance for the request

@@ -74,6 +74,8 @@ pub(crate) struct ConnectionConfig {
     pub timeout: u32,
     pub connect_timeout: u32,
     pub retry_limit: u8,
+    /// Paths to PEM-encoded CA certificate files to trust in addition to the system CA store.
+    pub ca_cert_files: Vec<String>,
 }
 
 impl Default for ConnectionConfig {
@@ -85,6 +87,7 @@ impl Default for ConnectionConfig {
             timeout: 5,
             connect_timeout: 5,
             retry_limit: 0,
+            ca_cert_files: Vec::new(),
         }
     }
 }
@@ -98,6 +101,7 @@ impl From<OssConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
         }
     }
 }
@@ -111,6 +115,7 @@ impl From<S3Config> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
         }
     }
 }
@@ -124,6 +129,7 @@ impl From<RegistryConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
         }
     }
 }
@@ -137,6 +143,7 @@ impl From<HttpProxyConfig> for ConnectionConfig {
             timeout: c.timeout,
             connect_timeout: c.connect_timeout,
             retry_limit: c.retry_limit,
+            ca_cert_files: c.ca_cert_files,
         }
     }
 }
@@ -165,7 +172,7 @@ impl<R> Progress<R> {
 impl<R: Read + Send + 'static> Read for Progress<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.inner.read(buf).inspect(|&count| {
-            self.current += count as usize;
+            self.current += count;
             (self.callback)((self.current, self.total));
         })
     }
@@ -386,7 +393,7 @@ impl Connection {
                             let client = Client::new();
                             let _ = client
                                 .get(ping_url.clone())
-                                .timeout(Duration::from_secs(connect_timeout as u64))
+                                .timeout(Duration::from_secs(connect_timeout))
                                 .send()
                                 .map(|resp| {
                                     let success = is_success_status(resp.status());
@@ -660,6 +667,12 @@ impl Connection {
             cb = cb.danger_accept_invalid_certs(true);
         }
 
+        for ca_cert_file in &config.ca_cert_files {
+            let pem = std::fs::read(ca_cert_file).map_err(|e| einval!(e))?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| einval!(e))?;
+            cb = cb.add_root_certificate(cert);
+        }
+
         if !proxy.is_empty() {
             cb = cb.proxy(reqwest::Proxy::all(proxy).map_err(|e| einval!(e))?)
         }
@@ -789,5 +802,6 @@ mod tests {
         assert_eq!(config.proxy.ping_url, "");
         assert_eq!(config.proxy.url, "");
         assert!(config.mirrors.is_empty());
+        assert!(config.ca_cert_files.is_empty());
     }
 }

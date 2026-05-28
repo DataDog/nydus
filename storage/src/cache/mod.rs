@@ -550,7 +550,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         // Use alloc_buf here to ensure 4k alignment for later use
         // in adjust_buffer_for_dio.
         let mut buffer = alloc_buf(chunk.uncompressed_size() as usize);
-        buffer.copy_from_slice(&self.d_buf[offset as usize..end]);
+        buffer.copy_from_slice(&self.d_buf[offset..end]);
         Ok(buffer)
     }
 
@@ -572,7 +572,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         // Use alloc_buf here to ensure 4k alignment for later use
         // in adjust_buffer_for_dio.
         let mut buffer = alloc_buf(chunk.uncompressed_size() as usize);
-        buffer.copy_from_slice(&self.d_buf[offset as usize..end]);
+        buffer.copy_from_slice(&self.d_buf[offset..end]);
         Ok(buffer)
     }
 
@@ -658,7 +658,7 @@ pub(crate) trait BlobCacheMgr: Send + Sync {
     fn gc(&self, _id: Option<&str>) -> bool;
 
     /// Get the underlying `BlobBackend` object of the blob cache object.
-    fn backend(&self) -> &(dyn BlobBackend);
+    fn backend(&self) -> &dyn BlobBackend;
 
     /// Get the blob cache to provide access to the `blob` object.
     fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> Result<Arc<dyn BlobCache>>;

@@ -13,13 +13,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  has:
+    runs-on: ubuntu-slim
+    outputs:
+      latest-16: ${{ env.HAS_LATEST_16 }}
+    env:
+      HAS_LATEST_16: ${{ (github.repository_owner == 'dragonflyoss' || vars.HAS_LATEST_16) && '1' || '' }}
+    steps:
+      - run: |
+          true
   contrib-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+    if: needs.has.outputs.latest-16
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Setup Golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6
       with:
         go-version-file: 'go.work'
         cache-dependency-path: "**/*.sum"
@@ -27,16 +39,19 @@ jobs:
       run: |
         make -e DOCKER=false nydusify-release
     - name: Upload Nydusify
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd/nydusify
 
   nydus-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+    if: needs.has.outputs.latest-16
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
       with:
@@ -47,7 +62,7 @@ jobs:
       run: |
         make release
     - name: Upload Nydus Binaries
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: nydus-artifact
         path: |
@@ -55,7 +70,10 @@ jobs:
           target/release/nydusd
 
   benchmark-description:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+    if: needs.has.outputs.latest-16
     steps:
     - name: Description
       run: |
@@ -65,8 +83,12 @@ jobs:
         echo "| ubuntu-22.04 | 2-core CPU (x86_64) | 7GB |" >> $GITHUB_STEP_SUMMARY
 
   benchmark-oci:
-    runs-on: ubuntu-latest
-    needs: [contrib-build, nydus-build]
+    runs-on: ubuntu-latest-16-cores
+    if: needs.has.outputs.latest-16
+    needs:
+      - has
+      - contrib-build
+      - nydus-build
     strategy:
       matrix:
         include:
@@ -84,14 +106,14 @@ jobs:
             tag: 8-al2022-jdk
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Download Nydus
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydus-artifact
         path: target/release
     - name: Download Nydusify
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd
@@ -106,14 +128,18 @@ jobs:
         export SNAPSHOTTER=overlayfs
         sudo -E make smoke-benchmark
     - name: Save BenchMark Result
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: benchmark-oci-${{ matrix.image }}
         path: smoke/${{ matrix.image }}-oci.json
 
   benchmark-fsversion-v5:
-    runs-on: ubuntu-latest
-    needs: [contrib-build, nydus-build]
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+      - contrib-build
+      - nydus-build
+    if: needs.has.outputs.latest-16
     strategy:
       matrix:
         include:
@@ -131,14 +157,14 @@ jobs:
             tag: 8-al2022-jdk
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Download Nydus
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydus-artifact
         path: target/release
     - name: Download Nydusify
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd
@@ -152,14 +178,18 @@ jobs:
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-fsversion-v5.json
         sudo -E make smoke-benchmark
     - name: Save BenchMark Result
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: benchmark-fsversion-v5-${{ matrix.image }}
         path: smoke/${{ matrix.image }}-fsversion-v5.json
 
   benchmark-fsversion-v6:
-    runs-on: ubuntu-latest
-    needs: [contrib-build, nydus-build]
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+      - contrib-build
+      - nydus-build
+    if: needs.has.outputs.latest-16
     strategy:
       matrix:
         include:
@@ -177,14 +207,14 @@ jobs:
             tag: 8-al2022-jdk
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Download Nydus
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydus-artifact
         path: target/release
     - name: Download Nydusify
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd
@@ -198,14 +228,18 @@ jobs:
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-fsversion-v6.json
         sudo -E make smoke-benchmark
     - name: Save BenchMark Result
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: benchmark-fsversion-v6-${{ matrix.image }}
         path: smoke/${{ matrix.image }}-fsversion-v6.json
 
   benchmark-zran:
-    runs-on: ubuntu-latest
-    needs: [contrib-build, nydus-build]
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+      - contrib-build
+      - nydus-build
+    if: needs.has.outputs.latest-16
     strategy:
       matrix:
         include:
@@ -223,14 +257,14 @@ jobs:
             tag: 8-al2022-jdk
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Download Nydus
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydus-artifact
         path: target/release
     - name: Download Nydusify
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd
@@ -244,14 +278,20 @@ jobs:
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-zran.json
         sudo -E make smoke-benchmark
     - name: Save BenchMark Result
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: benchmark-zran-${{ matrix.image }}
         path: smoke/${{ matrix.image }}-zran.json
 
   benchmark-result:
-    runs-on: ubuntu-latest
-    needs: [benchmark-oci, benchmark-fsversion-v5, benchmark-fsversion-v6, benchmark-zran]
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - has
+      - benchmark-oci
+      - benchmark-fsversion-v5
+      - benchmark-fsversion-v6
+      - benchmark-zran
+    if: needs.has.outputs.latest-16
     strategy:
       matrix:
         include:
@@ -269,24 +309,24 @@ jobs:
             tag: 8-al2022-jdk
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Download benchmark-oci
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: benchmark-oci-${{ matrix.image }}
         path: benchmark-result
     - name: Download benchmark-fsversion-v5
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: benchmark-fsversion-v5-${{ matrix.image }}
         path: benchmark-result
     - name: Download benchmark-fsversion-v6
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: benchmark-fsversion-v6-${{ matrix.image }}
         path: benchmark-result
     - name: Download benchmark-zran
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v7
       with:
         name: benchmark-zran-${{ matrix.image }}
         path: benchmark-result

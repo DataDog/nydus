@@ -49,6 +49,8 @@ impl From<UpgradeMgrError> for Error {
 /// FUSE fail-over policies.
 #[derive(PartialEq, Eq, Debug)]
 pub enum FailoverPolicy {
+    /// Do nothing.
+    None,
     /// Flush pending requests.
     Flush,
     /// Resend pending requests.
@@ -60,6 +62,7 @@ impl TryFrom<&str> for FailoverPolicy {
 
     fn try_from(p: &str) -> std::result::Result<Self, Self::Error> {
         match p {
+            "none" => Ok(FailoverPolicy::None),
             "flush" => Ok(FailoverPolicy::Flush),
             "resend" => Ok(FailoverPolicy::Resend),
             x => Err(einval!(format!("invalid FUSE fail-over mode {}", x))),
@@ -160,10 +163,7 @@ impl UpgradeManager {
 
     pub fn save_vfs_stat(&mut self, vfs: &Vfs) -> Result<()> {
         let vfs_state_data = vfs.save_to_bytes().map_err(|e| {
-            let io_err = io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to save vfs state: {:?}", e),
-            );
+            let io_err = io::Error::other(format!("Failed to save vfs state: {:?}", e));
             UpgradeMgrError::Serialize(io_err)
         })?;
         self.fuse_deamon_stat.vfs_state_data = vfs_state_data;
@@ -437,11 +437,14 @@ pub mod fusedev_upgrade {
     /// Save state information for a FUSE daemon.
     pub fn save(daemon: &FusedevDaemon) -> Result<()> {
         let svc = daemon.get_default_fs_service().ok_or(Error::NotFound)?;
-        if !svc.get_vfs().initialized() {
+        let vfs = svc.get_vfs();
+        if !vfs.initialized() {
             return Err(Error::NotReady);
         }
 
         let mut mgr = svc.upgrade_mgr().unwrap();
+        mgr.save_vfs_stat(vfs)?;
+
         let backend_stat = FusedevBackendState::from(&mgr.fuse_deamon_stat);
 
         let state = backend_stat.save().map_err(UpgradeMgrError::Serialize)?;
@@ -477,13 +480,13 @@ pub mod fusedev_upgrade {
 
         // restore fuse fd
         if let Some(f) = mgr.return_file() {
-            svc.as_any()
-                .downcast_ref::<FusedevFsService>()
-                .unwrap()
-                .session
-                .lock()
-                .unwrap()
-                .set_fuse_file(f);
+            let fuse_svc = svc.as_any().downcast_ref::<FusedevFsService>().unwrap();
+            fuse_svc.session.lock().unwrap().set_fuse_file(f);
+
+            // drain fuse requests
+            if let Err(e) = fuse_svc.drain_fuse_requests() {
+                warn!("Failed to drain fuse requests: {}", e);
+            }
         }
 
         // restore vfs
@@ -520,6 +523,10 @@ mod tests {
     #[test]
     fn test_failover_policy() {
         assert_eq!(
+            FailoverPolicy::try_from("none").unwrap(),
+            FailoverPolicy::None
+        );
+        assert_eq!(
             FailoverPolicy::try_from("flush").unwrap(),
             FailoverPolicy::Flush
         );
@@ -528,11 +535,16 @@ mod tests {
             FailoverPolicy::Resend
         );
 
-        let strs = vec!["flash", "Resend"];
+        let strs = vec!["null", "flash", "Resend"];
         for s in strs.clone().into_iter() {
             assert!(FailoverPolicy::try_from(s).is_err());
         }
 
+        let str = String::from("none");
+        assert_eq!(
+            FailoverPolicy::try_from(&str).unwrap(),
+            FailoverPolicy::None
+        );
         let str = String::from("flush");
         assert_eq!(
             FailoverPolicy::try_from(&str).unwrap(),

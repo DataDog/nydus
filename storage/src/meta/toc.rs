@@ -460,41 +460,29 @@ impl TocEntryList {
         let header = Header::from_byte_slice(&buf[size..]);
         let entry_type = header.entry_type();
         if entry_type != EntryType::Regular {
-            return Err(Error::new(
-                ErrorKind::Other,
-                "Tar entry type for ToC is not a regular file",
-            ));
+            return Err(Error::other("Tar entry type for ToC is not a regular file"));
         }
-        let entry_size = header.entry_size().map_err(|_| {
-            Error::new(ErrorKind::Other, "failed to get entry size from tar header")
-        })?;
+        let entry_size = header
+            .entry_size()
+            .map_err(|_| Error::other("failed to get entry size from tar header"))?;
         if entry_size > size as u64 {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "invalid toc entry size in tar header, expect {}, got {}",
-                    size, entry_size
-                ),
-            ));
+            return Err(Error::other(format!(
+                "invalid toc entry size in tar header, expect {}, got {}",
+                size, entry_size
+            )));
         }
-        let name = header.path().map_err(|_| {
-            Error::new(
-                ErrorKind::Other,
-                "failed to get ToC file name from tar header",
-            )
-        })?;
+        let name = header
+            .path()
+            .map_err(|_| Error::other("failed to get ToC file name from tar header"))?;
         if name != Path::new(TOC_ENTRY_BLOB_TOC) {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!(
-                    "ToC file name from tar header doesn't match, {}",
-                    name.display()
-                ),
-            ));
+            return Err(Error::other(format!(
+                "ToC file name from tar header doesn't match, {}",
+                name.display()
+            )));
         }
         let _header = header
             .as_gnu()
-            .ok_or_else(|| Error::new(ErrorKind::Other, "invalid GNU tar header for ToC"))?;
+            .ok_or_else(|| Error::other("invalid GNU tar header for ToC"))?;
 
         let mut pos = size - entry_size as usize;
         let mut list = TocEntryList::new();
@@ -839,7 +827,6 @@ mod tests {
         digest.data[0] = 0;
         let location = TocLocation::with_digest(9010, 1024, digest);
         assert!(TocEntryList::read_from_blob::<fs::File>(blob.as_ref(), None, &location).is_err());
-        digest.data[0] = 79u8;
 
         let location = TocLocation::new(9000, 1024);
         assert!(TocEntryList::read_from_blob::<fs::File>(blob.as_ref(), None, &location).is_err());
@@ -910,7 +897,7 @@ mod tests {
             .open(tmp_file.unwrap().as_path())
             .unwrap();
 
-        entry.extract_from_buf(&buf, &mut file)?;
+        entry.extract_from_buf(buf, &mut file)?;
 
         let mut hasher = RafsDigest::hasher(digest::Algorithm::Sha256);
         let mut buffer = [0; 1024];
@@ -988,5 +975,103 @@ mod tests {
             s.unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()
         );
+    }
+
+    #[test]
+    fn test_toc_entry_name() {
+        // Empty name
+        let entry = TocEntry::default();
+        assert_eq!(entry.name().unwrap(), "");
+
+        // Normal name
+        let mut entry2 = TocEntry::default();
+        let name = "blob.meta";
+        entry2.name[..name.len()].copy_from_slice(name.as_bytes());
+        assert_eq!(entry2.name().unwrap(), "blob.meta");
+
+        // Invalid UTF-8 should return error
+        let mut entry3 = TocEntry::default();
+        entry3.name[0] = 0xff;
+        assert!(entry3.name().is_err());
+    }
+
+    #[test]
+    fn test_toc_entry_field_getters() {
+        let entry = TocEntry {
+            flags: 0,
+            reserved1: 0,
+            name: [0u8; 16],
+            uncompressed_digest: [0xabu8; 32],
+            compressed_offset: 0x1234,
+            compressed_size: 0x5678,
+            uncompressed_size: 0x9abc,
+            reserved2: [0u8; 48],
+        };
+
+        assert_eq!(entry.uncompressed_size(), 0x9abc);
+        assert_eq!(entry.compressed_offset(), 0x1234);
+        assert_eq!(entry.compressed_size(), 0x5678);
+        assert_eq!(entry.uncompressed_digest().data, [0xabu8; 32]);
+    }
+
+    #[test]
+    fn test_toc_entry_compressor_round_trip() {
+        let mut entry = TocEntry::default();
+
+        entry.set_compressor(compress::Algorithm::None).unwrap();
+        assert_eq!(entry.compressor().unwrap(), compress::Algorithm::None);
+
+        entry.set_compressor(compress::Algorithm::Zstd).unwrap();
+        assert_eq!(entry.compressor().unwrap(), compress::Algorithm::Zstd);
+
+        entry.set_compressor(compress::Algorithm::Lz4Block).unwrap();
+        assert_eq!(entry.compressor().unwrap(), compress::Algorithm::Lz4Block);
+
+        // Unsupported algorithm
+        assert!(entry.set_compressor(compress::Algorithm::GZip).is_err());
+    }
+
+    #[test]
+    fn test_toc_location_new() {
+        let loc = TocLocation::new(0x1000, 0x800);
+        assert!(!loc.auto_detect);
+        assert!(!loc.validate_digest);
+        assert_eq!(loc.offset, 0x1000);
+        assert_eq!(loc.size, 0x800);
+    }
+
+    #[test]
+    fn test_toc_location_with_digest() {
+        let digest = RafsDigest { data: [0x55u8; 32] };
+        let loc = TocLocation::with_digest(0x2000, 0x1000, digest);
+        assert!(!loc.auto_detect);
+        assert!(loc.validate_digest);
+        assert_eq!(loc.offset, 0x2000);
+        assert_eq!(loc.size, 0x1000);
+        assert_eq!(loc.digest.data, [0x55u8; 32]);
+    }
+
+    #[test]
+    fn test_toc_location_validate() {
+        // auto_detect=true skips validation
+        let auto = TocLocation::default();
+        assert!(auto.validate().is_ok());
+
+        // valid sizes (512–65536, multiple of 128)
+        assert!(TocLocation::new(0, 512).validate().is_ok());
+        assert!(TocLocation::new(0, 640).validate().is_ok());
+        assert!(TocLocation::new(0, 0x10000).validate().is_ok());
+
+        // invalid: below 512
+        assert!(TocLocation::new(0, 256).validate().is_err());
+        // invalid: above 0x10000
+        assert!(TocLocation::new(0, 0x10001).validate().is_err());
+        // invalid: not aligned to 128
+        assert!(TocLocation::new(0, 513).validate().is_err());
+    }
+
+    #[test]
+    fn test_toc_entry_struct_size() {
+        assert_eq!(std::mem::size_of::<TocEntry>(), 128);
     }
 }

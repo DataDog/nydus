@@ -23,7 +23,7 @@
 //!    one and only one child entry having the inode number as its assigned `child index'.
 //! 5) A child index mapping table is introduced, which is used to map `child index` into offset
 //!    from the base of the super block. The formula to calculate the inode offset is:
-//!      `inode_offset_from_sb = inode_table[child_index] << 3`
+//!    `inode_offset_from_sb = inode_table[child_index] << 3`
 //! 6) The child index mapping table follows the super block by default.
 //!
 //! Giving above definition, we could get the inode object for an inode number or child index as:
@@ -328,7 +328,7 @@ impl_bootstrap_converter!(RafsV5SuperBlock);
 impl Default for RafsV5SuperBlock {
     fn default() -> Self {
         Self {
-            s_magic: u32::to_le(RAFSV5_SUPER_MAGIC as u32),
+            s_magic: u32::to_le(RAFSV5_SUPER_MAGIC),
             s_fs_version: u32::to_le(RAFS_SUPER_VERSION_V5),
             s_sb_size: u32::to_le(RAFSV5_SUPERBLOCK_SIZE as u32),
             s_block_size: u32::to_le(RAFS_DEFAULT_CHUNK_SIZE as u32),
@@ -403,7 +403,7 @@ impl RafsV5InodeTable {
 
         // The offset is aligned with 8 bytes to make it easier to validate RafsV5Inode.
         let offset = offset >> 3;
-        self.data[(ino - 1) as usize] = u32::to_le(offset as u32);
+        self.data[(ino - 1) as usize] = u32::to_le(offset);
 
         Ok(())
     }
@@ -653,7 +653,17 @@ impl RafsV5BlobTable {
                         return Err(einval!());
                     }
                     let entry = &self.extended.entries[index];
-                    let blob_features = BlobFeatures::from_bits(entry.features).ok_or_else(|| einval!("invalid blob feature flags"))?;
+                    let blob_features = match BlobFeatures::try_from(entry.features) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            let known = BlobFeatures::from_bits_truncate(entry.features);
+                            let unknown = entry.features & !known.bits();
+                            if unknown != 0 {
+                                warn!("Unknown blob feature flags 0x{:x}, unknown bits: 0x{:x}, truncating.", entry.features, unknown);
+                            }
+                            known
+                        }
+                    };
                     (entry.chunk_count, entry.uncompressed_size, entry.compressed_size, blob_features)
                 } else {
                     (0, 0, 0, BlobFeatures::_V5_NO_EXT_BLOB_TABLE)
@@ -836,7 +846,7 @@ impl RafsV5ExtBlobTable {
         // Safe because it is already reserved enough space
         let (_, data, _) = unsafe {
             entries.set_len(count);
-            (&mut entries).align_to_mut::<u8>()
+            entries.align_to_mut::<u8>()
         };
 
         r.read_exact(data)?;
@@ -931,7 +941,6 @@ impl RafsV5Inode {
     pub fn size(&self) -> usize {
         size_of::<Self>()
             + (rafsv5_align(self.i_name_size as usize) + rafsv5_align(self.i_symlink_size as usize))
-                as usize
     }
 
     /// Get the uid and the gid of the inode.
@@ -955,39 +964,39 @@ impl RafsV5Inode {
     /// Check whether the inode is a directory.
     #[inline]
     pub fn is_dir(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFDIR)
     }
 
     /// Check whether the inode is a symlink.
     #[inline]
     pub fn is_symlink(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFLNK)
     }
 
     /// Check whether the inode is a regular file.
     #[inline]
     pub fn is_reg(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFREG)
     }
 
     /// Check whether the inode is a char device node.
     pub fn is_chrdev(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFCHR as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFCHR)
     }
 
     /// Check whether the inode is a block device node.
     pub fn is_blkdev(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFBLK as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFBLK)
     }
 
     /// Check whether the inode is a FIFO.
     pub fn is_fifo(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFIFO as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFIFO)
     }
 
     /// Check whether the inode is a socket.
     pub fn is_sock(&self) -> bool {
-        self.i_mode & libc::S_IFMT as u32 == libc::S_IFSOCK as u32
+        crate::metadata::file_type_bits(self.i_mode) == crate::metadata::mode_bits(libc::S_IFSOCK)
     }
 
     /// Check whether the inode is a hardlink.
@@ -1978,5 +1987,41 @@ pub mod tests {
         assert_eq!(xattrs.size(), 37);
         xattrs.remove(&OsString::from("user.key1"));
         assert_eq!(xattrs.size(), 19);
+    }
+
+    #[test]
+    fn test_unknown_blob_feature_flags() {
+        let mut ext_table = RafsV5ExtBlobTable::new();
+        ext_table.add(10, 1000, 500, 0x00001000);
+
+        let mut blob_table = RafsV5BlobTable::new();
+        blob_table.extended = ext_table;
+
+        let blob_id = "test_blob_id\0";
+        let mut blob_data = Vec::new();
+        blob_data.extend_from_slice(&u32::to_le_bytes(0));
+        blob_data.extend_from_slice(&u32::to_le_bytes(0));
+        blob_data.extend_from_slice(blob_id.as_bytes());
+
+        let tmp_file = TempFile::new().unwrap();
+        let mut tmp_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp_file.as_path())
+            .unwrap();
+        tmp_file.write_all(&blob_data).unwrap();
+        tmp_file.flush().unwrap();
+
+        let mut reader: RafsIoReader = Box::new(tmp_file);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        blob_table
+            .load(
+                &mut reader,
+                blob_data.len() as u32,
+                RAFS_DEFAULT_CHUNK_SIZE as u32,
+                RafsSuperFlags::empty(),
+            )
+            .unwrap();
+        assert_eq!(blob_table.entries.len(), 1);
     }
 }

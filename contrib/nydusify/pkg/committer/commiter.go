@@ -19,23 +19,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/labels"
-
 	"github.com/BraveY/snapshotter-converter/converter"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/reference/docker"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/committer/diff"
-	parserPkg "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
+	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/distribution/reference"
 	"github.com/dustin/go-humanize"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/committer/diff"
+	parserPkg "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 // Opt defines the options for committing container changes
@@ -46,6 +46,7 @@ type Opt struct {
 	Namespace         string
 
 	ContainerID    string
+	SourceImageRef string
 	SourceInsecure bool
 	TargetRef      string
 	TargetInsecure bool
@@ -104,6 +105,9 @@ func (cm *Committer) Commit(ctx context.Context, opt Opt) error {
 	}
 
 	originalSourceRef := inspect.Image
+	if opt.SourceImageRef != "" {
+		originalSourceRef = opt.SourceImageRef
+	}
 
 	logrus.Infof("pulling base bootstrap")
 	start := time.Now()
@@ -230,6 +234,14 @@ func (cm *Committer) Commit(ctx context.Context, opt Opt) error {
 		return appendedEg.Wait()
 	}
 
+	// Ensure filesystem changes are written to disk before committing
+	// This prevents issues where changes are still in memory buffers
+	// and not yet visible in the overlay filesystem's upper directory
+	logrus.Infof("syncing filesystem before commit")
+	if err := cm.syncFilesystem(ctx, opt.ContainerID); err != nil {
+		return errors.Wrap(err, "failed to sync filesystem")
+	}
+
 	if err := cm.pause(ctx, opt.ContainerID, commit); err != nil {
 		return errors.Wrap(err, "pause container to commit")
 	}
@@ -349,12 +361,12 @@ func (cm *Committer) commitUpperByDiff(ctx context.Context, appendMount func(pat
 
 // getDistributionSourceLabel returns the source label key and value for the image distribution
 func getDistributionSourceLabel(sourceRef string) (string, string) {
-	named, err := docker.ParseDockerRef(sourceRef)
+	named, err := reference.ParseDockerRef(sourceRef)
 	if err != nil {
 		return "", ""
 	}
-	host := docker.Domain(named)
-	labelValue := docker.Path(named)
+	host := reference.Domain(named)
+	labelValue := reference.Path(named)
 	labelKey := fmt.Sprintf("%s.%s", labels.LabelDistributionSource, host)
 
 	return labelKey, labelValue
@@ -513,6 +525,36 @@ func (cm *Committer) pause(ctx context.Context, containerID string, handle func(
 
 	logrus.Infof("unpausing container: %s", containerID)
 	return cm.manager.UnPause(ctx, containerID)
+}
+
+// syncFilesystem forces filesystem sync to ensure all changes are written to disk.
+// This is crucial for overlay filesystems where changes may still be in memory
+// buffers and not yet visible in the upper directory when committing.
+func (cm *Committer) syncFilesystem(ctx context.Context, containerID string) error {
+	inspect, err := cm.manager.Inspect(ctx, containerID)
+	if err != nil {
+		return errors.Wrap(err, "inspect container for sync")
+	}
+
+	// Use nsenter to execute sync command in the container's namespace
+	config := &Config{
+		Mount:  true,
+		PID:    true,
+		Target: inspect.Pid,
+	}
+
+	stderr, err := config.ExecuteContext(ctx, io.Discard, "sync")
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("execute sync in container namespace: %s", strings.TrimSpace(stderr)))
+	}
+
+	// Also sync the host filesystem to ensure overlay changes are written
+	cmd := exec.CommandContext(ctx, "sync")
+	if err := cmd.Run(); err != nil {
+		return errors.Wrap(err, "execute host sync")
+	}
+
+	return nil
 }
 
 func (cm *Committer) pushManifest(
@@ -802,14 +844,14 @@ func withRetry(handle func() error, total int) error {
 
 // ValidateRef validate the target image reference.
 func ValidateRef(ref string) (string, error) {
-	named, err := docker.ParseDockerRef(ref)
+	named, err := reference.ParseDockerRef(ref)
 	if err != nil {
 		return "", errors.Wrapf(err, "invalid image reference: %s", ref)
 	}
-	if _, ok := named.(docker.Digested); ok {
+	if _, ok := named.(reference.Digested); ok {
 		return "", fmt.Errorf("unsupported digested image reference: %s", ref)
 	}
-	named = docker.TagNameOnly(named)
+	named = reference.TagNameOnly(named)
 	return named.String(), nil
 }
 
@@ -868,7 +910,7 @@ func (cm *Committer) resolveContainerID(ctx context.Context, opt *Opt) error {
 	)
 
 	// Create containerd client directly
-	client, err := containerd.New(cm.manager.address)
+	client, err := client.New(cm.manager.address)
 	if err != nil {
 		return fmt.Errorf("failed to create containerd client: %w", err)
 	}

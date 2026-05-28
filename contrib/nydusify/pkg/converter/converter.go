@@ -8,36 +8,33 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/converter/provider"
-	pkgPvd "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
+	"time"
 
 	snapConv "github.com/BraveY/snapshotter-converter/converter"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/external/modctl"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
-
-	"encoding/json"
-
-	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/snapshotter/external"
-	"github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
-
+	modelspec "github.com/CloudNativeAI/model-spec/specs-go/v1"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/goharbor/acceleration-service/pkg/converter"
 	"github.com/goharbor/acceleration-service/pkg/platformutil"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/converter/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/external/modctl"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/parser"
+	pkgPvd "github.com/dragonflyoss/nydus/contrib/nydusify/pkg/provider"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/snapshotter/external"
+	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/utils"
 )
 
 type Opt struct {
@@ -45,9 +42,11 @@ type Opt struct {
 	ContainerdAddress string
 	NydusImagePath    string
 
-	Source       string
-	Target       string
-	ChunkDictRef string
+	Source        string
+	SourceArchive string
+	Target        string
+	TargetArchive string
+	ChunkDictRef  string
 
 	SourceBackendType   string
 	SourceBackendConfig string
@@ -81,12 +80,17 @@ type Opt struct {
 	Platforms    string
 
 	OutputJSON string
+
+	PushRetryCount int
+	PushRetryDelay string
 }
 
 type SourceBackendConfig struct {
 	Context string `json:"context"`
 	WorkDir string `json:"work_dir"`
 }
+
+var defaultRemoteFunc = pkgPvd.DefaultRemote
 
 func Convert(ctx context.Context, opt Opt) error {
 	if opt.SourceBackendType == "modelfile" {
@@ -119,11 +123,27 @@ func Convert(ctx context.Context, opt Opt) error {
 	if err != nil {
 		return errors.Wrap(err, "create temp directory")
 	}
-	pvd, err := provider.New(tmpDir, hosts(opt), opt.CacheMaxRecords, opt.CacheVersion, platformMC, 0)
+	pvd, err := provider.New(tmpDir, hosts(opt), opt.CacheMaxRecords, opt.CacheVersion, platformMC, 0, nil)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
+
+	// Parse retry delay
+	retryDelay, err := time.ParseDuration(opt.PushRetryDelay)
+	if err != nil {
+		return errors.Wrap(err, "parse push retry delay")
+	}
+
+	// Set push retry configuration
+	pvd.SetPushRetryConfig(opt.PushRetryCount, retryDelay)
+	// Set potential local source/target archives
+	pvd.WithLocalSource(opt.SourceArchive)
+	pvd.WithLocalTarget(opt.TargetArchive)
+
+	if opt.WithPlainHTTP {
+		pvd.UsePlainHTTP()
+	}
 
 	cvt, err := converter.New(
 		converter.WithProvider(pvd),
@@ -425,7 +445,7 @@ func pushManifest(
 		return errors.Wrap(err, "make config desc")
 	}
 
-	remoter, err := pkgPvd.DefaultRemote(opt.Target, opt.TargetInsecure)
+	remoter, err := defaultRemoteFunc(opt.Target, opt.TargetInsecure)
 	if err != nil {
 		return errors.Wrap(err, "create remote")
 	}
@@ -519,7 +539,7 @@ func pushManifest(
 }
 
 func getSourceManifestSubject(ctx context.Context, sourceRef string, inscure, plainHTTP bool) (*ocispec.Descriptor, error) {
-	remoter, err := pkgPvd.DefaultRemote(sourceRef, inscure)
+	remoter, err := defaultRemoteFunc(sourceRef, inscure)
 	if err != nil {
 		return nil, errors.Wrap(err, "create remote")
 	}

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -243,7 +244,7 @@ func TestWithRetry(t *testing.T) {
 	err := WithRetry(func() error {
 		_, err := http.Get("http://localhost:5000")
 		return err
-	})
+	}, 3, 5*time.Second)
 	require.ErrorIs(t, err, syscall.ECONNREFUSED)
 }
 
@@ -300,4 +301,48 @@ func TestRetryWithAttempts_SuccessOnFirstAttempt(t *testing.T) {
 		return context.Canceled
 	}, 3)
 	require.Equal(t, context.Canceled, err)
+}
+
+func TestWithRetryNonRetryableError(t *testing.T) {
+	calls := 0
+	err := WithRetry(func() error {
+		calls++
+		// Return a non-retryable error (does not match any retryable pattern)
+		return fmt.Errorf("permanent non-retryable error")
+	}, 3, 0)
+	require.Error(t, err)
+	// Only called once: first attempt fails, second iteration sees
+	// RetryWithHTTP==false and returns immediately
+	require.Equal(t, 1, calls)
+}
+
+func TestUnpackFileNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Create a file to archive
+	srcFile := tmpDir + "/source.txt"
+	require.NoError(t, os.WriteFile(srcFile, []byte("content"), 0644))
+
+	// Create a tar.gz archive with "source.txt"
+	var buf strings.Builder
+	// Use an in-memory buffer
+	var rawBuf []byte
+	bufWriter := &writerToSlice{data: &rawBuf}
+	require.NoError(t, createArchive([]string{srcFile}, bufWriter))
+
+	// Unpack a file that does NOT exist in the archive
+	target := tmpDir + "/output.txt"
+	err := UnpackFile(strings.NewReader(string(rawBuf)), "nonexistent.txt", target)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not found file")
+	_ = buf
+}
+
+// writerToSlice is a helper that writes bytes into a []byte slice.
+type writerToSlice struct {
+	data *[]byte
+}
+
+func (w *writerToSlice) Write(p []byte) (int, error) {
+	*w.data = append(*w.data, p...)
+	return len(p), nil
 }
