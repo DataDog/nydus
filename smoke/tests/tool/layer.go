@@ -17,8 +17,8 @@ import (
 	"testing"
 
 	"github.com/BraveY/snapshotter-converter/converter"
-	"github.com/containerd/containerd/archive"
-	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/archive"
+	"github.com/containerd/containerd/v2/content/local"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/xattr"
 	"github.com/stretchr/testify/assert"

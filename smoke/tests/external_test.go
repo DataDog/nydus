@@ -19,7 +19,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
-	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/content/local"
 	"github.com/containerd/log"
 
 	"github.com/BraveY/snapshotter-converter/converter"
