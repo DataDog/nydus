@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/archive/compression"
+	"github.com/containerd/containerd/v2/archive/compression"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"

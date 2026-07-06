@@ -21,7 +21,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/checker"
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/chunkdict/generator"
