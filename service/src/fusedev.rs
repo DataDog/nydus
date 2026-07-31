@@ -224,6 +224,20 @@ impl<'a> FuseSysfsNotifier<'a> {
     fn notify_flush(&self) -> NydusResult<()> {
         self.notify("flush")
     }
+
+    fn read_waiting(&self) -> Option<u64> {
+        for base_path in Self::get_possible_base_paths() {
+            let path = PathBuf::from(base_path)
+                .join(self.conn.load(Ordering::Acquire).to_string())
+                .join("waiting");
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[allow(dead_code)]
@@ -294,13 +308,30 @@ impl FusedevFsService {
         match self.failover_policy {
             FailoverPolicy::None => Ok(()),
             FailoverPolicy::Flush => sysfs_notifier.notify_flush(),
-            FailoverPolicy::Resend => fusedev_notifier.notify_resend().or_else(|e| {
-                error!(
-                    "Failed to notify resend by /dev/fuse, {:?}. Trying to do it by sysfs",
-                    e
-                );
-                sysfs_notifier.notify_resend()
-            }),
+            FailoverPolicy::Resend => {
+                let result = fusedev_notifier.notify_resend().or_else(|e| {
+                    error!(
+                        "Failed to notify resend by /dev/fuse, {:?}. Trying to do it by sysfs",
+                        e
+                    );
+                    sysfs_notifier.notify_resend()
+                });
+                if result.is_err() {
+                    let conn_id = self.conn.load(Ordering::Acquire);
+                    match sysfs_notifier.read_waiting() {
+                        Some(n) => warn!(
+                            "FUSE connection {}: resend failed, {} request(s) remain on processing queue",
+                            conn_id, n
+                        ),
+                        None => warn!(
+                            "FUSE connection {}: resend failed, request count could not be determined",
+                            conn_id
+                        ),
+                    }
+                }
+
+                result
+            }
         }
     }
 }
