@@ -149,4 +149,4 @@ vhost-user-backend = "0.21.0"
 fuse-backend-rs = "0.14.0"
 
 [patch.crates-io]
-fuse-backend-rs = { git = "https://github.com/Zephyrcf/fuse-backend-rs.git", tag = "v0.0.1" }
+fuse-backend-rs = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs.git", rev = "c7dfc0592706a37f0685347cdfeccec2a442d059" }

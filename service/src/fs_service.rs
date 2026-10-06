@@ -118,7 +118,9 @@ pub trait FsService: Send + Sync {
             return Err(Error::AlreadyExists);
         }
         let (backend, id_mapping) = fs_backend_factory(&cmd)?;
-        let index = self.get_vfs().mount(backend, &cmd.mountpoint, id_mapping)?;
+        let index = self
+            .get_vfs()
+            .mount_with_id_mapping(backend, &cmd.mountpoint, id_mapping)?;
         info!("{} filesystem mounted at {}", &cmd.fs_type, &cmd.mountpoint);
 
         if let Err(e) = self.backend_collection().add(&cmd.mountpoint, &cmd) {
@@ -171,9 +173,10 @@ pub trait FsService: Send + Sync {
 
     /// Restore a filesystem instance.
     fn restore_mount(&self, cmd: &FsBackendMountCmd, vfs_index: u8) -> Result<()> {
-        let (backend, id_mapping) = fs_backend_factory(cmd)?;
+        // The per-mount id_mapping is restored with the Vfs state (Vfs::restore_from_bytes).
+        let (backend, _id_mapping) = fs_backend_factory(cmd)?;
         self.get_vfs()
-            .restore_mount(backend, vfs_index, &cmd.mountpoint, id_mapping)
+            .restore_mount(backend, vfs_index, &cmd.mountpoint)
             .map_err(VfsError::RestoreMount)?;
         self.backend_collection().add(&cmd.mountpoint, cmd)?;
         info!("backend fs restored at {}", cmd.mountpoint);
