@@ -320,11 +320,7 @@ impl TarBuilder {
                             break;
                         } else {
                             let node = self.create_directory(&target_paths[..=idx])?;
-                            tmp_tree.insert_child(Tree::new(node));
-                            // Children are sorted, so the new directory may not be last.
-                            let child_idx = tmp_tree
-                                .get_child_idx(target_paths[idx].as_bytes())
-                                .unwrap();
+                            let child_idx = tmp_tree.insert_child(Tree::new(node));
                             tmp_tree = &mut tmp_tree.children[child_idx];
                         }
                     }
