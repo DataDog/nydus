@@ -617,9 +617,7 @@ mod nbd {
                 Arg::new("bootstrap")
                     .long("bootstrap")
                     .short('B')
-                    .help("Path to the RAFS filesystem metadata file")
-                    .requires("localfs-dir")
-                    .conflicts_with("config"),
+                    .help("Path to the RAFS filesystem metadata file, used with `--localfs-dir` or with a RAFS daemon `--config` (same format as `nydusd fuse`)"),
             )
             .arg(
                 Arg::new("localfs-dir")
@@ -647,9 +645,18 @@ mod nbd {
         bti: BuildTimeInfo,
         _apisock: Option<&str>,
     ) -> Result<()> {
-        let mut entry = if let Some(bootstrap) = args.value_of("bootstrap") {
+        let mut entry = if let (Some(bootstrap), Some(config)) =
+            (args.value_of("bootstrap"), args.value_of("config"))
+        {
+            if args.value_of("localfs-dir").is_some() {
+                return Err(einval!(
+                    "option `-D/--localfs-dir` conflicts with `-B/--bootstrap` + `-C/--config`"
+                ));
+            }
+            rafs_config_to_blob_entry(config, bootstrap)?
+        } else if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args.value_of("localfs-dir").ok_or_else(|| {
-                einval!("option `-D/--localfs-dir` is required by `--boootstrap`")
+                einval!("option `-D/--localfs-dir` or `-C/--config` is required by `--boootstrap`")
             })?;
             let config = r#"
             {
@@ -724,6 +731,36 @@ mod nbd {
         DAEMON_CONTROLLER.set_daemon(daemon);
 
         Ok(())
+    }
+
+    /// Build a block device blob cache entry from a RAFS daemon configuration (v1 or v2,
+    /// as accepted by `nydusd fuse --config`) and a bootstrap file. This lets callers
+    /// that already hold a FUSE daemon configuration (e.g. the nydus-snapshotter
+    /// `extraoption`) expose the same image as a block device.
+    fn rafs_config_to_blob_entry(config: &str, bootstrap: &str) -> Result<BlobCacheEntry> {
+        let cfg = ConfigV2::from_file(config)?;
+        let backend = cfg
+            .backend
+            .as_ref()
+            .ok_or_else(|| einval!("no backend in configuration file"))?;
+        let cache = cfg
+            .cache
+            .as_ref()
+            .ok_or_else(|| einval!("no cache in configuration file"))?;
+        let entry = serde_json::json!({
+            "type": "bootstrap",
+            "id": "disk-default",
+            "domain_id": "block-nbd",
+            "config_v2": {
+                "version": 2,
+                "id": "block-nbd-factory",
+                "backend": backend,
+                "external_backends": cfg.external_backends,
+                "cache": cache,
+                "metadata_path": bootstrap,
+            },
+        });
+        BlobCacheEntry::from_str(&entry.to_string())
     }
 }
 
