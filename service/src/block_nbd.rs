@@ -14,6 +14,7 @@ use std::any::Any;
 use std::fs::{self, OpenOptions};
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -53,6 +54,11 @@ const NBD_REPLY_MAGIC: u32 = 0x67446698;
 const NBD_OK: u32 = 0;
 const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
+/// Maximum size of the read buffers of the requests a worker serves at the same time, in units
+/// of [NBD_INFLIGHT_UNIT]. The kernel bounds the number of requests of a connection; this bounds
+/// their memory when they are large.
+const NBD_MAX_INFLIGHT_UNITS: u32 = (128 << 20) / NBD_INFLIGHT_UNIT;
+const NBD_INFLIGHT_UNIT: u32 = 4096;
 
 fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
     let code = nix::request_code_none!(0xab, cmd);
@@ -158,11 +164,15 @@ pub struct NbdWorker {
 
 impl NbdWorker {
     /// Run the event loop to handle NBD requests from kernel in asynchronous mode.
+    ///
+    /// Requests are served concurrently, up to [NBD_MAX_INFLIGHT_UNITS] of data at a time: the
+    /// kernel sends every request of a queue on the same connection, so serving them one at a
+    /// time would serialize all reads of the device, each one possibly waiting on the backend.
     pub async fn run(self) {
         let device =
             match BlockDevice::new_with_cache_manager(self.blob_id.clone(), self.cache_mgr.clone())
             {
-                Ok(v) => v,
+                Ok(v) => Rc::new(v),
                 Err(e) => {
                     error!(
                         "block_nbd: failed to create block device for {}, {}",
@@ -173,7 +183,10 @@ impl NbdWorker {
             };
 
         // Safe because the RawFd is valid during the lifetime of run().
-        let mut sock = unsafe { UnixStream::from_raw_fd(self.sock_user.as_raw_fd()) };
+        let sock = Rc::new(unsafe { UnixStream::from_raw_fd(self.sock_user.as_raw_fd()) });
+        // Serializes replies, a reply header and its data must not interleave with another reply.
+        let reply_lock = Rc::new(tokio::sync::Mutex::new(()));
+        let inflight = Arc::new(tokio::sync::Semaphore::new(NBD_MAX_INFLIGHT_UNITS as usize));
         let mut receiver = self.sender.subscribe();
         let mut buf = vec![0u8; NBD_REQUEST_HEADER_SIZE];
         let mut pos = 0;
@@ -181,25 +194,41 @@ impl NbdWorker {
         while self.active.load(Ordering::Acquire) {
             tokio::select! {
                 (res, s) = sock.read(buf.slice(pos..)) => {
+                    buf = s.into_inner();
                     match res {
                         Err(e) => {
                             warn!("block_nbd: failed to get request from kernel for {}, {}", self.blob_id, e);
                             break;
                         }
+                        Ok(0) => break,
                         Ok(sz) => {
-                            buf = s.into_inner();
                             pos += sz;
-                            if pos == NBD_REQUEST_HEADER_SIZE {
-                                match self.handle_request(&buf, &mut sock, &device).await {
-                                    Ok(true) => {}
-                                    Ok(false) => break,
-                                    Err(e) => {
-                                        warn!("block_nbd: failed to handle request for {}, {}", self.blob_id, e);
-                                        break;
-                                    }
-                                }
-                                pos = 0;
+                            if pos < NBD_REQUEST_HEADER_SIZE {
+                                continue;
                             }
+                            pos = 0;
+                            let request = NbdRequest::parse(&buf);
+                            if request.ty == NBD_CMD_DISC {
+                                break;
+                            }
+                            let units = request
+                                .len
+                                .div_ceil(NBD_INFLIGHT_UNIT)
+                                .clamp(1, NBD_MAX_INFLIGHT_UNITS);
+                            let permit = match inflight.clone().acquire_many_owned(units).await {
+                                Ok(v) => v,
+                                Err(_) => break,
+                            };
+                            let (device, sock, reply_lock) = (device.clone(), sock.clone(), reply_lock.clone());
+                            let blob_id = self.blob_id.clone();
+                            tokio_uring::spawn(async move {
+                                let _permit = permit;
+                                let (code, data) = request.serve(&device).await;
+                                let _guard = reply_lock.lock().await;
+                                if let Err(e) = request.reply(&sock, code, data).await {
+                                    warn!("block_nbd: failed to reply to request for {}, {}", blob_id, e);
+                                }
+                            });
                         }
                     }
                 }
@@ -208,62 +237,77 @@ impl NbdWorker {
                 }
             }
         }
+
+        // Let the requests being served finish before the socket gets closed.
+        let _ = inflight.acquire_many(NBD_MAX_INFLIGHT_UNITS).await;
+    }
+}
+
+/// A request received from the kernel NBD driver.
+struct NbdRequest {
+    magic: u32,
+    ty: u32,
+    handle: u64,
+    pos: u64,
+    len: u32,
+}
+
+impl NbdRequest {
+    fn parse(mut header: &[u8]) -> Self {
+        NbdRequest {
+            magic: header.get_u32(),
+            ty: header.get_u32(),
+            handle: header.get_u64(),
+            pos: header.get_u64(),
+            len: header.get_u32(),
+        }
     }
 
-    async fn handle_request(
-        &self,
-        mut request: &[u8],
-        sock: &mut UnixStream,
-        device: &BlockDevice,
-    ) -> Result<bool> {
-        let magic = request.get_u32();
-        let ty = request.get_u32();
-        let handle = request.get_u64();
-        let pos = request.get_u64();
-        let len = request.get_u32();
-
+    /// Serve the request, returning the reply code and the data read.
+    async fn serve(&self, device: &BlockDevice) -> (u32, Vec<u8>) {
         let block_size = device.block_size();
-        let mut code = NBD_OK;
-        let mut data_buf = alloc_buf(len as usize);
-        if magic != NBD_REQUEST_MAGIC || pos % block_size != 0 || len as u64 % block_size != 0 {
+        let data_buf = alloc_buf(self.len as usize);
+        if self.magic != NBD_REQUEST_MAGIC
+            || self.pos % block_size != 0
+            || self.len as u64 % block_size != 0
+        {
             warn!(
                 "block_nbd: invalid request magic 0x{:x}, type {}, pos 0x{:x}, len 0x{:x}",
-                magic, ty, pos, len
+                self.magic, self.ty, self.pos, self.len
             );
-            code = NBD_EINVAL;
-        } else if ty == NBD_CMD_READ {
-            let start = (pos / block_size) as u32;
-            let count = len / block_size as u32;
-            let (res, buf) = device.async_read(start, count, data_buf).await;
-            data_buf = buf;
-            match res {
-                Ok(sz) => {
-                    if sz != len as usize {
-                        warn!("block_nbd: got 0x{:x} bytes, expect 0x{:x}", sz, len);
-                        code = NBD_EIO;
-                    }
-                }
-                Err(e) => {
-                    warn!("block_nbd: failed to read data from block device, {}", e);
-                    code = NBD_EIO;
-                }
-            }
-        } else if ty == NBD_CMD_DISC {
-            return Ok(false);
+            return (NBD_EINVAL, data_buf);
+        }
+        if self.ty != NBD_CMD_READ {
+            return (NBD_OK, data_buf);
         }
 
+        let start = (self.pos / block_size) as u32;
+        let count = self.len / block_size as u32;
+        let (res, data_buf) = device.async_read(start, count, data_buf).await;
+        match res {
+            Ok(sz) if sz == self.len as usize => (NBD_OK, data_buf),
+            Ok(sz) => {
+                warn!("block_nbd: got 0x{:x} bytes, expect 0x{:x}", sz, self.len);
+                (NBD_EIO, data_buf)
+            }
+            Err(e) => {
+                warn!("block_nbd: failed to read data from block device, {}", e);
+                (NBD_EIO, data_buf)
+            }
+        }
+    }
+
+    async fn reply(&self, sock: &UnixStream, code: u32, data: Vec<u8>) -> Result<()> {
         let mut reply = Vec::with_capacity(16);
         reply.put_u32(NBD_REPLY_MAGIC);
         reply.put_u32(code);
-        reply.put_u64(handle);
-        assert_eq!(reply.len(), 16);
-        assert_eq!(data_buf.len(), len as usize);
+        reply.put_u64(self.handle);
+        assert_eq!(data.len(), self.len as usize);
         sock.write_all(reply).await.0?;
-        if code == NBD_OK {
-            sock.write_all(data_buf).await.0?;
+        if code == NBD_OK && self.ty == NBD_CMD_READ {
+            sock.write_all(data).await.0?;
         }
-
-        Ok(true)
+        Ok(())
     }
 }
 

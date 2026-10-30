@@ -1012,6 +1012,9 @@ pub struct BlobCacheEntryConfigV2 {
     /// Optional file path for metadata blob.
     #[serde(default)]
     pub metadata_path: Option<String>,
+    /// Optional RAFS configuration, its `batch_size` amplifies reads of the blob data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rafs: Option<RafsConfigV2>,
 }
 
 impl BlobCacheEntryConfigV2 {
@@ -1071,7 +1074,7 @@ impl From<&BlobCacheEntryConfigV2> for ConfigV2 {
             backend: Some(c.backend.clone()),
             external_backends: c.external_backends.clone(),
             cache: Some(c.cache.clone()),
-            rafs: None,
+            rafs: c.rafs.clone(),
             overlay: None,
             internal: ConfigV2Internal::default(),
         }
@@ -1599,6 +1602,7 @@ impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
             external_backends: v.external_backends.clone(),
             cache: (&cache_config).try_into()?,
             metadata_path: v.metadata_path.clone(),
+            rafs: None,
         })
     }
 }

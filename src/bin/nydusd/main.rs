@@ -757,10 +757,44 @@ mod nbd {
                 "backend": backend,
                 "external_backends": cfg.external_backends,
                 "cache": cache,
+                // Carries amplify_io: without it the block device fetches missing data one chunk
+                // per backend request, instead of batching the following chunks as RAFS does.
+                "rafs": cfg.rafs,
                 "metadata_path": bootstrap,
             },
         });
         BlobCacheEntry::from_str(&entry.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rafs_config_to_blob_entry;
+        use vmm_sys_util::tempfile::TempFile;
+
+        #[test]
+        fn test_rafs_config_to_blob_entry() {
+            let tests = [
+                (
+                    "V1AmplifyIO",
+                    r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct","amplify_io":10485760}"#,
+                    10485760,
+                ),
+                (
+                    "V1DefaultAmplifyIO",
+                    r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct"}"#,
+                    1048576,
+                ),
+            ];
+            for (name, config, want) in tests {
+                let file = TempFile::new().unwrap();
+                std::fs::write(file.as_path(), config).unwrap();
+                let entry =
+                    rafs_config_to_blob_entry(file.as_path().to_str().unwrap(), "/tmp/boot")
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let rafs = entry.blob_config.as_ref().unwrap().rafs.as_ref();
+                assert_eq!(rafs.map(|r| r.user_io_batch_size), Some(want), "{name}");
+            }
+        }
     }
 }
 

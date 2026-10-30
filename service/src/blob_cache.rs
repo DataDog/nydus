@@ -527,16 +527,28 @@ impl DataBlob {
     }
 
     /// Read data from the cached data blob in asynchronous mode.
+    ///
+    /// Fetching missing data from the backend blocks, so it runs on the blocking thread pool:
+    /// otherwise it would stall every other request served by the calling io_uring runtime.
     pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
-        match self.blob.get_blob_object() {
-            Some(obj) => match obj.fetch_range_uncompressed(pos, buf.bytes_total() as u64) {
-                Ok(_) => self.file.read_at(buf, pos).await,
-                Err(e) => (Err(e), buf),
-            },
-            None => (
+        let blob = self.blob.clone();
+        let blob_id = self.blob_id.clone();
+        let size = buf.bytes_total() as u64;
+        let fetched = tokio::task::spawn_blocking(move || match blob.get_blob_object() {
+            Some(obj) => obj.fetch_range_uncompressed(pos, size),
+            None => Err(eio!(format!(
+                "blob_cache: failed to get BlobObject for blob {}",
+                blob_id
+            ))),
+        })
+        .await;
+        match fetched {
+            Ok(Ok(())) => self.file.read_at(buf, pos).await,
+            Ok(Err(e)) => (Err(e), buf),
+            Err(e) => (
                 Err(eio!(format!(
-                    "blob_cache: failed to get BlobObject for blob {}",
-                    self.blob_id
+                    "blob_cache: failed to fetch blob data, {}",
+                    e
                 ))),
                 buf,
             ),
