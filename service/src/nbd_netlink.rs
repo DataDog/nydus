@@ -362,7 +362,9 @@ mod tests {
 
     #[test]
     fn test_parse_replies() {
-        let tests: Vec<(&str, Vec<u8>, std::result::Result<(usize, bool), i32>)> = vec![
+        /// Payloads and acknowledgment parsed, or errno of the reply.
+        type Want = std::result::Result<(usize, bool), i32>;
+        let tests: Vec<(&str, Vec<u8>, Want)> = vec![
             (
                 "Ack",
                 {
