@@ -51,6 +51,8 @@ pub mod block_device;
 pub mod block_nbd;
 #[cfg(target_os = "linux")]
 mod fs_cache;
+#[cfg(all(target_os = "linux", feature = "block-nbd"))]
+pub mod nbd_netlink;
 
 #[cfg(target_os = "linux")]
 pub use fs_cache::FsCacheHandler;
