@@ -330,6 +330,44 @@ impl BlockDevice {
         Ok(())
     }
 
+    /// Read blocks in pieces of `piece_size` bytes at most, concurrently, once the missing data of
+    /// all the blocks is fetched in one go: a single stream of reads of the blob cache does not
+    /// reach the bandwidth of local disks.
+    pub async fn async_read_pieces(
+        device: &Rc<Self>,
+        start: u32,
+        blocks: u32,
+        piece_size: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        device.async_fetch(start, blocks).await?;
+        let piece_blocks = max(1, piece_size / device.block_size()) as u32;
+        let (mut pos, end) = (start, start + blocks);
+        let mut reads = Vec::new();
+        while pos < end {
+            let (device, count) = (device.clone(), min(piece_blocks, end - pos));
+            reads.push(tokio_uring::spawn(async move {
+                let size = device.blocks_to_size(count) as usize;
+                match device.async_read(pos, count, alloc_buf(size)).await {
+                    (Ok(sz), buf) if sz == size => Ok(buf),
+                    (Ok(sz), _) => Err(eio!(format!(
+                        "block_device: got 0x{:x} bytes, expect 0x{:x}",
+                        sz, size
+                    ))),
+                    (Err(e), _) => Err(e),
+                }
+            }));
+            pos += count;
+        }
+        let mut pieces = Vec::with_capacity(reads.len());
+        for read in reads {
+            pieces.push(
+                read.await
+                    .map_err(|e| eio!(format!("block_device: {}", e)))??,
+            );
+        }
+        Ok(pieces)
+    }
+
     /// Export a RAFS filesystem as a raw block disk image.
     pub fn export(
         blob_entry: BlobCacheEntry,
@@ -700,6 +738,39 @@ mod tests {
         assert_eq!(device.blocks(), 0x209);
 
         device
+    }
+
+    #[test]
+    fn test_block_device_read_pieces() {
+        let tmp_dir = TempDir::new().unwrap();
+        let entry = create_bootstrap_entry(&tmp_dir);
+        let mgr = BlobCacheMgr::new();
+        mgr.add_blob_entry(&entry).unwrap();
+        let blob_id = generate_blob_key(&entry.domain_id, &entry.blob_id);
+        let device = Rc::new(BlockDevice::new_with_cache_manager(blob_id, Arc::new(mgr)).unwrap());
+        let blocks = device.blocks();
+
+        tokio_uring::start(async move {
+            let size = device.blocks_to_size(blocks) as usize;
+            let (res, whole) = device.async_read(0, blocks, vec![0u8; size]).await;
+            assert_eq!(res.unwrap(), size);
+            // (name, piece size, pieces)
+            let tests = [
+                ("OnePiece", size as u64, 1),
+                ("Pieces", 8192, (blocks as usize).div_ceil(2)),
+                ("SmallerThanBlock", 1, blocks as usize),
+            ];
+            for (name, piece_size, want) in tests {
+                let pieces = BlockDevice::async_read_pieces(&device, 0, blocks, piece_size)
+                    .await
+                    .unwrap();
+                assert_eq!(pieces.len(), want, "{}", name);
+                assert_eq!(pieces.concat(), whole, "{}", name);
+            }
+            assert!(BlockDevice::async_read_pieces(&device, blocks, 1, 8192)
+                .await
+                .is_err());
+        })
     }
 
     #[test]

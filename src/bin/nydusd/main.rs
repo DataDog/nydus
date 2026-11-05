@@ -617,7 +617,7 @@ mod nbd {
                 Arg::new("bootstrap")
                     .long("bootstrap")
                     .short('B')
-                    .help("Path to the RAFS filesystem metadata file, used with `--localfs-dir` or with a RAFS daemon `--config` (same format as `nydusd fuse`)"),
+                    .help("Path to the RAFS filesystem metadata file"),
             )
             .arg(
                 Arg::new("localfs-dir")
@@ -648,15 +648,11 @@ mod nbd {
         let mut entry = if let (Some(bootstrap), Some(config)) =
             (args.value_of("bootstrap"), args.value_of("config"))
         {
-            if args.value_of("localfs-dir").is_some() {
-                return Err(einval!(
-                    "option `-D/--localfs-dir` conflicts with `-B/--bootstrap` + `-C/--config`"
-                ));
-            }
+            // A RAFS configuration, as taken by `nydusd fuse`.
             rafs_config_to_blob_entry(config, bootstrap)?
         } else if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args.value_of("localfs-dir").ok_or_else(|| {
-                einval!("option `-D/--localfs-dir` or `-C/--config` is required by `--boootstrap`")
+                einval!("option `-D/--localfs-dir` is required by `--boootstrap`")
             })?;
             let config = r#"
             {
@@ -733,10 +729,7 @@ mod nbd {
         Ok(())
     }
 
-    /// Build a block device blob cache entry from a RAFS daemon configuration (v1 or v2,
-    /// as accepted by `nydusd fuse --config`) and a bootstrap file. This lets callers
-    /// that already hold a FUSE daemon configuration (e.g. the nydus-snapshotter
-    /// `extraoption`) expose the same image as a block device.
+    /// Build the blob cache entry of a block device from a RAFS configuration and its bootstrap.
     fn rafs_config_to_blob_entry(config: &str, bootstrap: &str) -> Result<BlobCacheEntry> {
         let cfg = ConfigV2::from_file(config)?;
         let backend = cfg
