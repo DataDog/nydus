@@ -11,6 +11,7 @@
 //! the Linux Network Block Device driver.
 
 use std::any::Any;
+use std::cmp::min;
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -52,6 +53,10 @@ const NBD_EINVAL: u32 = 22;
 /// their memory when they are large.
 const NBD_MAX_INFLIGHT_UNITS: u32 = (128 << 20) / NBD_INFLIGHT_UNIT;
 const NBD_INFLIGHT_UNIT: u32 = 4096;
+/// Requests are read in pieces of this size at most, concurrently, once fetched as a whole: a
+/// request is one stream of reads of the blob cache, local disks need several reads in flight to
+/// reach their bandwidth.
+const NBD_READ_PIECE: u64 = 1 << 20;
 
 /// Network Block Device server to expose RAFSv6 images as block devices.
 ///
@@ -259,10 +264,9 @@ impl NbdRequest {
         }
     }
 
-    /// Serve the request, returning the reply code and the data read.
-    async fn serve(&self, device: &BlockDevice) -> (u32, Vec<u8>) {
+    /// Serve the request, returning the reply code and the data read, in pieces.
+    async fn serve(&self, device: &Rc<BlockDevice>) -> (u32, Vec<Vec<u8>>) {
         let block_size = device.block_size();
-        let data_buf = alloc_buf(self.len as usize);
         if self.magic != NBD_REQUEST_MAGIC
             || self.pos % block_size != 0
             || self.len as u64 % block_size != 0
@@ -271,37 +275,64 @@ impl NbdRequest {
                 "block_nbd: invalid request magic 0x{:x}, type {}, pos 0x{:x}, len 0x{:x}",
                 self.magic, self.ty, self.pos, self.len
             );
-            return (NBD_EINVAL, data_buf);
+            return (NBD_EINVAL, Vec::new());
         }
         if self.ty != NBD_CMD_READ {
-            return (NBD_OK, data_buf);
+            return (NBD_OK, Vec::new());
         }
 
-        let start = (self.pos / block_size) as u32;
-        let count = self.len / block_size as u32;
-        let (res, data_buf) = device.async_read(start, count, data_buf).await;
-        match res {
-            Ok(sz) if sz == self.len as usize => (NBD_OK, data_buf),
-            Ok(sz) => {
-                warn!("block_nbd: got 0x{:x} bytes, expect 0x{:x}", sz, self.len);
-                (NBD_EIO, data_buf)
-            }
-            Err(e) => {
-                warn!("block_nbd: failed to read data from block device, {}", e);
-                (NBD_EIO, data_buf)
+        // Fetch the missing data of the whole request first, in one go so it gets amplified.
+        let (start, count) = ((self.pos / block_size) as u32, self.len / block_size as u32);
+        if let Err(e) = device.async_fetch(start, count).await {
+            warn!("block_nbd: failed to fetch data of block device, {}", e);
+            return (NBD_EIO, Vec::new());
+        }
+
+        let mut reads = Vec::new();
+        let (mut pos, end) = (self.pos, self.pos + self.len as u64);
+        while pos < end {
+            let len = min(NBD_READ_PIECE, end - pos);
+            let device = device.clone();
+            let (start, count) = ((pos / block_size) as u32, (len / block_size) as u32);
+            reads.push(tokio_uring::spawn(async move {
+                device
+                    .async_read(start, count, alloc_buf(len as usize))
+                    .await
+            }));
+            pos += len;
+        }
+        let mut pieces = Vec::with_capacity(reads.len());
+        let mut code = NBD_OK;
+        for read in reads {
+            match read.await {
+                Ok((Ok(sz), buf)) if sz == buf.len() => pieces.push(buf),
+                Ok((Ok(sz), buf)) => {
+                    warn!("block_nbd: got 0x{:x} bytes, expect 0x{:x}", sz, buf.len());
+                    code = NBD_EIO;
+                }
+                Ok((Err(e), _)) => {
+                    warn!("block_nbd: failed to read data from block device, {}", e);
+                    code = NBD_EIO;
+                }
+                Err(e) => {
+                    warn!("block_nbd: failed to read data from block device, {}", e);
+                    code = NBD_EIO;
+                }
             }
         }
+        (code, pieces)
     }
 
-    async fn reply(&self, sock: &UnixStream, code: u32, data: Vec<u8>) -> Result<()> {
+    async fn reply(&self, sock: &UnixStream, code: u32, pieces: Vec<Vec<u8>>) -> Result<()> {
         let mut reply = Vec::with_capacity(16);
         reply.put_u32(NBD_REPLY_MAGIC);
         reply.put_u32(code);
         reply.put_u64(self.handle);
-        assert_eq!(data.len(), self.len as usize);
         sock.write_all(reply).await.0?;
         if code == NBD_OK && self.ty == NBD_CMD_READ {
-            sock.write_all(data).await.0?;
+            for piece in pieces {
+                sock.write_all(piece).await.0?;
+            }
         }
         Ok(())
     }

@@ -299,6 +299,37 @@ impl BlockDevice {
         (Ok(total_size), buf)
     }
 
+    /// Fetch the missing data of blocks from the backend, without reading it.
+    ///
+    /// A range is fetched in one go per data blob, so the backend amplifies a large read.
+    pub async fn async_fetch(&self, mut start: u32, mut blocks: u32) -> Result<()> {
+        if start
+            .checked_add(blocks)
+            .is_none_or(|end| end > self.blocks())
+        {
+            return Err(einval!("block_device: invalid parameters to fetch()"));
+        }
+        while blocks > 0 {
+            let (range, node) = self
+                .ranges
+                .get_superset(&Range::new_point(start))
+                .ok_or_else(|| {
+                    eio!(format!(
+                        "block_device: can not locate block 0x{:x} for meta blob {}",
+                        start, self.blob_id
+                    ))
+                })?;
+            let count = min(range.max as u32 - start + 1, blocks);
+            if let NodeState::Valued(BlockRange::DataBlob(d)) = node {
+                let offset = self.blocks_to_size(start - range.min as u32);
+                d.async_fetch(offset, self.blocks_to_size(count)).await?;
+            }
+            start += count;
+            blocks -= count;
+        }
+        Ok(())
+    }
+
     /// Export a RAFS filesystem as a raw block disk image.
     pub fn export(
         blob_entry: BlobCacheEntry,
@@ -669,6 +700,37 @@ mod tests {
         assert_eq!(device.blocks(), 0x209);
 
         device
+    }
+
+    #[test]
+    fn test_block_device_fetch() {
+        let tmp_dir = TempDir::new().unwrap();
+        let entry = create_bootstrap_entry(&tmp_dir);
+        let mgr = BlobCacheMgr::new();
+        mgr.add_blob_entry(&entry).unwrap();
+        let blob_id = generate_blob_key(&entry.domain_id, &entry.blob_id);
+        let device = BlockDevice::new_with_cache_manager(blob_id, Arc::new(mgr)).unwrap();
+        let blocks = device.blocks() as u32;
+
+        tokio_uring::start(async move {
+            // (name, start, blocks, fetch succeeds)
+            let tests = [
+                ("WholeDevice", 0, blocks, true),
+                ("Overflow", u32::MAX, u32::MAX, false),
+                ("BeyondDevice", blocks, 1, false),
+            ];
+            for (name, start, count, ok) in tests {
+                assert_eq!(
+                    device.async_fetch(start, count).await.is_ok(),
+                    ok,
+                    "{}",
+                    name
+                );
+            }
+            // Fetched blocks can then be read.
+            let (res, _) = device.async_read(4, 2, vec![0u8; 8192]).await;
+            assert_eq!(res.unwrap(), 8192);
+        })
     }
 
     #[test]
