@@ -9,11 +9,10 @@
 //! requests and waits up to the dead connection timeout for a new server to reconfigure it.
 //! This is what lets a restarted or upgraded nydusd take over a device in use.
 
-use std::io::{Error, Result};
-use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::fs::File;
+use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::os::fd::{FromRawFd, RawFd};
 
-const NETLINK_GENERIC: libc::c_int = 16;
 const GENL_ID_CTRL: u16 = 0x10;
 const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
@@ -22,14 +21,11 @@ const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
 const NLMSG_ERROR: u16 = 0x2;
-const NLMSG_DONE: u16 = 0x3;
 const NLA_F_NESTED: u16 = 0x8000;
-const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | 0x4000);
 
 const NLMSG_HDR_LEN: usize = 16;
 const GENL_HDR_LEN: usize = 4;
 const NLA_HDR_LEN: usize = 4;
-const RECV_BUF_LEN: usize = 32 << 10;
 
 const NBD_GENL_FAMILY_NAME: &str = "nbd";
 const NBD_GENL_VERSION: u8 = 1;
@@ -42,7 +38,6 @@ const NBD_ATTR_INDEX: u16 = 1;
 const NBD_ATTR_SIZE_BYTES: u16 = 2;
 const NBD_ATTR_BLOCK_SIZE_BYTES: u16 = 3;
 const NBD_ATTR_SERVER_FLAGS: u16 = 5;
-const NBD_ATTR_CLIENT_FLAGS: u16 = 6;
 const NBD_ATTR_SOCKETS: u16 = 7;
 const NBD_ATTR_DEAD_CONN_TIMEOUT: u16 = 8;
 const NBD_ATTR_BACKEND_IDENTIFIER: u16 = 10;
@@ -50,7 +45,6 @@ const NBD_SOCK_ITEM: u16 = 1;
 const NBD_SOCK_FD: u16 = 1;
 
 /// Parameters of a device to connect or reconfigure.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceConfig {
     pub index: u32,
     pub size_bytes: u64,
@@ -63,17 +57,17 @@ pub struct DeviceConfig {
     pub backend_id: String,
 }
 
-/// Netlink attribute builder.
+/// Netlink attributes.
 #[derive(Default)]
 struct Attrs(Vec<u8>);
 
 impl Attrs {
     fn put(&mut self, ty: u16, payload: &[u8]) -> &mut Self {
-        let len = NLA_HDR_LEN + payload.len();
-        self.0.extend_from_slice(&(len as u16).to_ne_bytes());
+        let len = (NLA_HDR_LEN + payload.len()) as u16;
+        self.0.extend_from_slice(&len.to_ne_bytes());
         self.0.extend_from_slice(&ty.to_ne_bytes());
         self.0.extend_from_slice(payload);
-        self.0.resize(align4(self.0.len()), 0);
+        self.0.resize(self.0.len().next_multiple_of(4), 0);
         self
     }
 
@@ -86,106 +80,75 @@ impl Attrs {
     }
 
     fn put_str(&mut self, ty: u16, v: &str) -> &mut Self {
-        let mut s = v.as_bytes().to_vec();
-        s.push(0);
-        self.put(ty, &s)
+        self.put(ty, &[v.as_bytes(), &[0]].concat())
     }
 
     fn put_nested(&mut self, ty: u16, nested: &Attrs) -> &mut Self {
         self.put(ty | NLA_F_NESTED, &nested.0)
     }
+
+    /// Parse the attributes of `buf` into `(type, payload)` pairs.
+    fn parse(mut buf: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut attrs = Vec::new();
+        while buf.len() >= NLA_HDR_LEN {
+            let len = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
+            let ty = u16::from_ne_bytes([buf[2], buf[3]]);
+            if len < NLA_HDR_LEN || len > buf.len() {
+                break;
+            }
+            attrs.push((ty, &buf[NLA_HDR_LEN..len]));
+            buf = &buf[len.next_multiple_of(4).min(buf.len())..];
+        }
+        attrs
+    }
 }
 
-fn align4(n: usize) -> usize {
-    (n + 3) & !3
-}
-
-/// Encode a generic netlink request.
-fn encode_request(family: u16, cmd: u8, version: u8, seq: u32, attrs: &Attrs) -> Vec<u8> {
-    let len = NLMSG_HDR_LEN + GENL_HDR_LEN + attrs.0.len();
-    let mut msg = Vec::with_capacity(len);
-    msg.extend_from_slice(&(len as u32).to_ne_bytes());
+/// Encode a generic netlink request, which the kernel acknowledges.
+fn encode_request(family: u16, cmd: u8, version: u8, attrs: &Attrs) -> Vec<u8> {
+    let len = (NLMSG_HDR_LEN + GENL_HDR_LEN + attrs.0.len()) as u32;
+    let mut msg = Vec::with_capacity(len as usize);
+    msg.extend_from_slice(&len.to_ne_bytes());
     msg.extend_from_slice(&family.to_ne_bytes());
     msg.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
-    msg.extend_from_slice(&seq.to_ne_bytes());
-    msg.extend_from_slice(&0u32.to_ne_bytes());
+    // Sequence number and port id: requests are sent one at a time, to the kernel.
+    msg.extend_from_slice(&[0; 8]);
     msg.extend_from_slice(&[cmd, version, 0, 0]);
     msg.extend_from_slice(&attrs.0);
     msg
 }
 
-/// Iterate over the netlink attributes of `buf`, yielding `(type, payload)`.
-fn parse_attrs(mut buf: &[u8]) -> Vec<(u16, &[u8])> {
-    let mut attrs = Vec::new();
-    while buf.len() >= NLA_HDR_LEN {
-        let len = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
-        let ty = u16::from_ne_bytes([buf[2], buf[3]]) & NLA_TYPE_MASK;
-        if len < NLA_HDR_LEN || len > buf.len() {
-            break;
-        }
-        attrs.push((ty, &buf[NLA_HDR_LEN..len]));
-        buf = &buf[align4(len).min(buf.len())..];
-    }
-    attrs
-}
-
-fn attr<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
-    attrs.iter().find(|(t, _)| *t == ty).map(|(_, p)| *p)
-}
-
-#[cfg(test)]
-fn attr_u32(attrs: &[(u16, &[u8])], ty: u16) -> Option<u32> {
-    attr(attrs, ty)
-        .and_then(|p| p.get(..4))
-        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-}
-
-fn attr_u16(attrs: &[(u16, &[u8])], ty: u16) -> Option<u16> {
-    attr(attrs, ty)
-        .and_then(|p| p.get(..2))
-        .map(|b| u16::from_ne_bytes(b.try_into().unwrap()))
-}
-
-/// A reply to a request: the attributes of each message carrying data, or the error the
-/// kernel acknowledged the request with.
-fn parse_replies(mut buf: &[u8], seq: u32) -> Result<(Vec<Vec<u8>>, bool)> {
-    let mut payloads = Vec::new();
-    let mut acked = false;
+/// Parse the netlink messages of `buf` replying to a request, keeping the attributes of the
+/// first one carrying data in `reply`. Returns whether the kernel acknowledged the request.
+fn parse_replies(mut buf: &[u8], reply: &mut Option<Vec<u8>>) -> Result<bool> {
     while buf.len() >= NLMSG_HDR_LEN {
         let len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
         let ty = u16::from_ne_bytes([buf[4], buf[5]]);
-        let msg_seq = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
         if len < NLMSG_HDR_LEN || len > buf.len() {
             return Err(einval!("nbd_netlink: truncated netlink message"));
         }
         let body = &buf[NLMSG_HDR_LEN..len];
-        if msg_seq == seq {
-            match ty {
-                NLMSG_ERROR => {
-                    let code = body
-                        .get(..4)
-                        .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
-                        .ok_or_else(|| einval!("nbd_netlink: truncated netlink error"))?;
-                    if code != 0 {
-                        return Err(Error::from_raw_os_error(-code));
-                    }
-                    acked = true;
-                }
-                NLMSG_DONE => acked = true,
-                _ if body.len() >= GENL_HDR_LEN => payloads.push(body[GENL_HDR_LEN..].to_vec()),
-                _ => {}
-            }
+        if ty == NLMSG_ERROR {
+            let code = body
+                .get(..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                .ok_or_else(|| einval!("nbd_netlink: truncated netlink error"))?;
+            return match code {
+                0 => Ok(true),
+                _ => Err(Error::from_raw_os_error(-code)),
+            };
         }
-        buf = &buf[align4(len).min(buf.len())..];
+        if reply.is_none() {
+            *reply = body.get(GENL_HDR_LEN..).map(<[u8]>::to_vec);
+        }
+        buf = &buf[len.next_multiple_of(4).min(buf.len())..];
     }
-    Ok((payloads, acked))
+    Ok(false)
 }
 
 /// A generic netlink socket bound to the NBD family.
 pub struct NbdNetlink {
-    sock: OwnedFd,
+    sock: File,
     family: u16,
-    seq: u32,
 }
 
 impl NbdNetlink {
@@ -196,73 +159,44 @@ impl NbdNetlink {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                NETLINK_GENERIC,
+                libc::NETLINK_GENERIC,
             )
         };
         if fd < 0 {
             return Err(Error::last_os_error());
         }
-        // Safe because `fd` is a valid file descriptor owned by nobody else.
-        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut nl = NbdNetlink {
-            sock,
+            // Safe because `fd` is a valid file descriptor owned by nobody else.
+            sock: unsafe { File::from_raw_fd(fd) },
             family: GENL_ID_CTRL,
-            seq: 0,
         };
         let mut attrs = Attrs::default();
         attrs.put_str(CTRL_ATTR_FAMILY_NAME, NBD_GENL_FAMILY_NAME);
-        let replies = nl.request(CTRL_CMD_GETFAMILY, 1, &attrs)?;
-        nl.family = replies
-            .iter()
-            .find_map(|p| attr_u16(&parse_attrs(p), CTRL_ATTR_FAMILY_ID))
+        let reply = nl
+            .request(CTRL_CMD_GETFAMILY, 1, &attrs)?
+            .unwrap_or_default();
+        nl.family = Attrs::parse(&reply)
+            .into_iter()
+            .find(|(ty, _)| *ty == CTRL_ATTR_FAMILY_ID)
+            .and_then(|(_, v)| Some(u16::from_ne_bytes(v.get(..2)?.try_into().ok()?)))
             .ok_or_else(|| enoent!("nbd_netlink: NBD generic netlink family not found"))?;
         Ok(nl)
     }
 
-    fn request(&mut self, cmd: u8, version: u8, attrs: &Attrs) -> Result<Vec<Vec<u8>>> {
-        self.seq = self.seq.wrapping_add(1);
-        let msg = encode_request(self.family, cmd, version, self.seq, attrs);
-        // Safe because the kernel address is zeroed apart from its family.
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        // Safe because `msg` and `addr` are valid for the duration of the call.
-        let sent = unsafe {
-            libc::sendto(
-                self.sock.as_raw_fd(),
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                0,
-                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-                size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if sent < 0 {
-            return Err(Error::last_os_error());
-        }
-
-        let mut payloads = Vec::new();
-        let mut buf = vec![0u8; RECV_BUF_LEN];
+    /// Send a request and wait for its acknowledgment, returning the attributes of its reply.
+    fn request(&mut self, cmd: u8, version: u8, attrs: &Attrs) -> Result<Option<Vec<u8>>> {
+        // Messages written to a netlink socket go to the kernel.
+        self.sock
+            .write_all(&encode_request(self.family, cmd, version, attrs))?;
+        let mut reply = None;
+        let mut buf = vec![0u8; 32 << 10];
         loop {
-            // Safe because `buf` is valid for `buf.len()` bytes.
-            let n = unsafe {
-                libc::recv(
-                    self.sock.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
+            let n = match self.sock.read(&mut buf) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                res => res?,
             };
-            if n < 0 {
-                let e = Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            let (mut p, acked) = parse_replies(&buf[..n as usize], self.seq)?;
-            payloads.append(&mut p);
-            if acked {
-                return Ok(payloads);
+            if parse_replies(&buf[..n], &mut reply)? {
+                return Ok(reply);
             }
         }
     }
@@ -284,15 +218,14 @@ impl NbdNetlink {
     }
 
     /// Configure device `cfg.index` to be served through the given connections.
+    ///
+    /// The device stays in the pool of the nbd module once disconnected.
     pub fn connect(&mut self, cfg: &DeviceConfig, socks: &[RawFd]) -> Result<()> {
         let mut attrs = Self::device_attrs(cfg, socks);
         attrs
             .put_u64(NBD_ATTR_SIZE_BYTES, cfg.size_bytes)
             .put_u64(NBD_ATTR_BLOCK_SIZE_BYTES, cfg.block_size)
-            .put_u64(NBD_ATTR_SERVER_FLAGS, cfg.server_flags)
-            // No NBD_CFLAG_DESTROY_ON_DISCONNECT: the device stays in the pool of the nbd module
-            // after a disconnect.
-            .put_u64(NBD_ATTR_CLIENT_FLAGS, 0);
+            .put_u64(NBD_ATTR_SERVER_FLAGS, cfg.server_flags);
         self.request(NBD_CMD_CONNECT, NBD_GENL_VERSION, &attrs)
             .map(|_| ())
     }
@@ -313,28 +246,16 @@ impl NbdNetlink {
     }
 }
 
-/// Parse the device index from a device path like `/dev/nbd3`.
-pub fn device_index(path: &str) -> Result<u32> {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix("nbd"))
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| einval!(format!("invalid NBD device path {}", path)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn header(len: u32, ty: u16, seq: u32) -> Vec<u8> {
-        let mut h = Vec::new();
-        h.extend_from_slice(&len.to_ne_bytes());
-        h.extend_from_slice(&ty.to_ne_bytes());
-        h.extend_from_slice(&0u16.to_ne_bytes());
-        h.extend_from_slice(&seq.to_ne_bytes());
-        h.extend_from_slice(&0u32.to_ne_bytes());
-        h
+    fn message(ty: u16, body: &[u8]) -> Vec<u8> {
+        let mut m = ((NLMSG_HDR_LEN + body.len()) as u32).to_ne_bytes().to_vec();
+        m.extend_from_slice(&ty.to_ne_bytes());
+        m.extend_from_slice(&[0; 10]);
+        m.extend_from_slice(body);
+        m
     }
 
     #[test]
@@ -343,95 +264,57 @@ mod tests {
         attrs
             .put_u32(NBD_ATTR_INDEX, 3)
             .put_str(NBD_ATTR_BACKEND_IDENTIFIER, "id");
-        let msg = encode_request(0x20, NBD_CMD_CONNECT, 1, 7, &attrs);
+        let msg = encode_request(0x20, NBD_CMD_CONNECT, 1, &attrs);
         assert_eq!(msg.len(), NLMSG_HDR_LEN + GENL_HDR_LEN + 8 + 8);
-        assert_eq!(
-            u32::from_ne_bytes(msg[0..4].try_into().unwrap()) as usize,
-            msg.len()
-        );
-        assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), 0x20);
-        assert_eq!(u32::from_ne_bytes(msg[8..12].try_into().unwrap()), 7);
+        assert_eq!(&msg[0..4], &(msg.len() as u32).to_ne_bytes());
+        assert_eq!(&msg[4..6], &0x20u16.to_ne_bytes());
         assert_eq!(&msg[16..18], &[NBD_CMD_CONNECT, 1]);
-        let parsed = parse_attrs(&msg[NLMSG_HDR_LEN + GENL_HDR_LEN..]);
-        assert_eq!(attr_u32(&parsed, NBD_ATTR_INDEX), Some(3));
         assert_eq!(
-            attr(&parsed, NBD_ATTR_BACKEND_IDENTIFIER),
-            Some(&b"id\0"[..])
+            Attrs::parse(&msg[NLMSG_HDR_LEN + GENL_HDR_LEN..]),
+            vec![
+                (NBD_ATTR_INDEX, &3u32.to_ne_bytes()[..]),
+                (NBD_ATTR_BACKEND_IDENTIFIER, &b"id\0"[..]),
+            ]
         );
     }
 
     #[test]
     fn test_parse_replies() {
-        /// Payloads and acknowledgment parsed, or errno of the reply.
-        type Want = std::result::Result<(usize, bool), i32>;
-        let tests: Vec<(&str, Vec<u8>, Want)> = vec![
-            (
-                "Ack",
-                {
-                    let mut m = header(20, NLMSG_ERROR, 5);
-                    m.extend_from_slice(&0i32.to_ne_bytes());
-                    m
-                },
-                Ok((0, true)),
-            ),
+        let mut data = vec![NBD_CMD_CONNECT, 1, 0, 0];
+        data.extend_from_slice(&Attrs::default().put_u32(NBD_ATTR_INDEX, 9).0);
+        let ack = message(NLMSG_ERROR, &0i32.to_ne_bytes());
+        /// Name, messages, length of the reply, and whether acknowledged, or the errno.
+        type Test = (
+            &'static str,
+            Vec<u8>,
+            Option<usize>,
+            std::result::Result<bool, i32>,
+        );
+        let tests: Vec<Test> = vec![
+            ("Ack", ack.clone(), None, Ok(true)),
             (
                 "Error",
-                {
-                    let mut m = header(20, NLMSG_ERROR, 5);
-                    m.extend_from_slice(&(-libc::EBUSY).to_ne_bytes());
-                    m
-                },
+                message(NLMSG_ERROR, &(-libc::EBUSY).to_ne_bytes()),
+                None,
                 Err(libc::EBUSY),
             ),
             (
                 "DataThenAck",
-                {
-                    let mut attrs = Attrs::default();
-                    attrs.put_u32(NBD_ATTR_INDEX, 9);
-                    let mut m = header(
-                        (NLMSG_HDR_LEN + GENL_HDR_LEN + attrs.0.len()) as u32,
-                        0x20,
-                        5,
-                    );
-                    m.extend_from_slice(&[NBD_CMD_CONNECT, 1, 0, 0]);
-                    m.extend_from_slice(&attrs.0);
-                    let mut ack = header(20, NLMSG_ERROR, 5);
-                    ack.extend_from_slice(&0i32.to_ne_bytes());
-                    m.extend_from_slice(&ack);
-                    m
-                },
-                Ok((1, true)),
+                [message(0x20, &data), ack.clone()].concat(),
+                Some(data.len() - GENL_HDR_LEN),
+                Ok(true),
             ),
-            (
-                "OtherSequence",
-                {
-                    let mut m = header(20, NLMSG_ERROR, 4);
-                    m.extend_from_slice(&(-libc::EBUSY).to_ne_bytes());
-                    m
-                },
-                Ok((0, false)),
-            ),
+            ("DataOnly", message(0x20, &data), Some(8), Ok(false)),
+            ("Truncated", ack[..8].to_vec(), None, Ok(false)),
         ];
-        for (name, buf, want) in tests {
-            let got = parse_replies(&buf, 5).map(|(p, acked)| (p.len(), acked));
-            match want {
-                Ok(w) => assert_eq!(got.unwrap(), w, "{name}"),
-                Err(code) => assert_eq!(got.unwrap_err().raw_os_error(), Some(code), "{name}"),
+        for (name, buf, want_reply, want) in tests {
+            let mut reply = None;
+            match (parse_replies(&buf, &mut reply), want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}"),
+                (Err(e), Err(code)) => assert_eq!(e.raw_os_error(), Some(code), "{name}"),
+                (got, _) => panic!("{name}: {got:?}"),
             }
-        }
-    }
-
-    #[test]
-    fn test_device_index() {
-        let tests = [
-            ("/dev/nbd0", Some(0)),
-            ("/dev/nbd17", Some(17)),
-            ("nbd3", Some(3)),
-            ("/dev/sda", None),
-            ("/dev/nbd", None),
-        ];
-        for (path, want) in tests {
-            assert_eq!(device_index(path).ok(), want, "{path}");
+            assert_eq!(reply.map(|r| r.len()), want_reply, "{name}");
         }
     }
 }

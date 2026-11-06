@@ -23,6 +23,7 @@ use bytes::{Buf, BufMut};
 use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use tokio::sync::broadcast::{channel, Sender};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_uring::buf::IoBuf;
 use tokio_uring::net::UnixStream;
 
@@ -32,7 +33,7 @@ use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
     NydusDaemon,
 };
-use crate::nbd_netlink::{device_index, DeviceConfig, NbdNetlink};
+use crate::nbd_netlink::{DeviceConfig, NbdNetlink};
 use crate::{Error as NydusError, Result as NydusResult};
 
 const NBD_FLAG_HAS_FLAGS: u32 = 0x1;
@@ -46,11 +47,12 @@ const NBD_REPLY_MAGIC: u32 = 0x67446698;
 const NBD_OK: u32 = 0;
 const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
-/// Maximum size of the read buffers of the requests a worker serves at the same time, in units
-/// of [NBD_INFLIGHT_UNIT]. The kernel bounds the number of requests of a connection; this bounds
-/// their memory when they are large.
-const NBD_MAX_INFLIGHT_UNITS: u32 = (128 << 20) / NBD_INFLIGHT_UNIT;
-const NBD_INFLIGHT_UNIT: u32 = 4096;
+/// Seconds the kernel queues the requests of a device whose server died, waiting for a new
+/// server to take it over.
+const NBD_DEAD_CONN_TIMEOUT: u64 = 600;
+/// Bytes of the requests a worker serves at the same time. The kernel bounds the number of
+/// requests of a connection; this bounds their memory when they are large.
+const NBD_MAX_INFLIGHT_BYTES: u32 = 128 << 20;
 /// Requests are read in pieces of this size at most, see [BlockDevice::async_read_pieces].
 const NBD_READ_PIECE: u64 = 1 << 20;
 
@@ -64,73 +66,69 @@ pub struct NbdService {
     blob_id: String,
     cache_mgr: Arc<BlobCacheMgr>,
     config: DeviceConfig,
+    // Kernel ends of the connections of the workers, until handed to the kernel.
+    kernel_socks: Mutex<Vec<StdUnixStream>>,
     sender: Arc<Sender<u32>>,
 }
 
 impl NbdService {
-    /// Create a new instance of [NbdService] to expose a RAFSv6 image as NBD device `index`.
+    /// Create a new instance of [NbdService] to expose a RAFSv6 image as a block device.
     ///
-    /// Once all the connections of the device are dead, the kernel queues its requests for up to
-    /// `dead_conn_timeout` seconds, waiting for a server to reconfigure it. Reconfiguring the
-    /// device requires the same `backend_id`.
-    pub fn new(
-        device: Arc<BlockDevice>,
-        index: u32,
-        dead_conn_timeout: u64,
-        backend_id: String,
-    ) -> Result<Self> {
+    /// The NBD device at `nbd_path` gets configured by [NbdService::connect]. A server taking the
+    /// device over from a previous one must have the same `backend_id`.
+    pub fn new(device: Arc<BlockDevice>, nbd_path: String, backend_id: String) -> Result<Self> {
         let (sender, _receiver) = channel(4);
         Ok(NbdService {
             active: Arc::new(AtomicBool::new(true)),
             blob_id: device.meta_blob_id().to_string(),
             cache_mgr: device.cache_mgr().clone(),
             config: DeviceConfig {
-                index,
+                index: device_index(&nbd_path)?,
                 size_bytes: device.blocks() as u64 * device.block_size(),
                 block_size: device.block_size(),
                 server_flags: (NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY | NBD_FLAG_CAN_MULTI_CONN)
                     as u64,
-                dead_conn_timeout,
+                dead_conn_timeout: NBD_DEAD_CONN_TIMEOUT,
                 backend_id,
             },
+            kernel_socks: Mutex::new(Vec::new()),
             sender: Arc::new(sender),
         })
     }
 
-    /// Create `count` workers and hand their connections to the kernel: connect the device, or
+    /// Create a [NbdWorker] to run the event loop to handle NBD requests from kernel.
+    pub fn create_worker(&self) -> Result<NbdWorker> {
+        let (sock1, sock2) = StdUnixStream::pair()?;
+        self.kernel_socks.lock().unwrap().push(sock1);
+
+        Ok(NbdWorker {
+            active: self.active.clone(),
+            blob_id: self.blob_id.clone(),
+            cache_mgr: self.cache_mgr.clone(),
+            sock_user: sock2,
+            sender: self.sender.clone(),
+        })
+    }
+
+    /// Hand the connections of the workers created so far to the kernel: connect the device, or
     /// take it over from a previous server which died or exited.
-    pub fn attach(&self, count: u32) -> Result<Vec<NbdWorker>> {
-        let mut workers = Vec::with_capacity(count as usize);
-        let mut kernel_socks = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let (sock_kern, sock_user) = StdUnixStream::pair()?;
-            kernel_socks.push(sock_kern);
-            workers.push(NbdWorker {
-                active: self.active.clone(),
-                blob_id: self.blob_id.clone(),
-                cache_mgr: self.cache_mgr.clone(),
-                sock_user,
-                sender: self.sender.clone(),
-            });
-        }
-        let fds: Vec<RawFd> = kernel_socks.iter().map(|s| s.as_raw_fd()).collect();
-        let mut nl = NbdNetlink::open()?;
-        if let Err(e) = nl.connect(&self.config, &fds) {
-            // The device is still configured by a previous server: reattach it. The kernel only
-            // replaces dead connections and checks the backend identifier, so this cannot steal
-            // a device from a live server.
-            if e.raw_os_error() != Some(libc::EBUSY) {
-                return Err(e);
-            }
-            warn!(
-                "block_nbd: device nbd{} is already configured, taking it over",
-                self.config.index
-            );
-            nl.reconfigure(&self.config, &fds)?;
-        }
+    pub fn connect(&self) -> Result<()> {
         // The kernel holds its own references to the sockets handed over.
-        drop(kernel_socks);
-        Ok(workers)
+        let socks = std::mem::take(&mut *self.kernel_socks.lock().unwrap());
+        let fds: Vec<RawFd> = socks.iter().map(|s| s.as_raw_fd()).collect();
+        let mut nl = NbdNetlink::open()?;
+        match nl.connect(&self.config, &fds) {
+            // The kernel only replaces dead connections and checks the backend identifier, so
+            // this cannot steal a device from a live server.
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                warn!(
+                    "block_nbd: device nbd{} is already configured, taking it over",
+                    self.config.index
+                );
+                nl.reconfigure(&self.config, &fds)
+            }
+            res => res,
+        }
     }
 
     /// Stop serving the device, keeping it configured: once its connections are dead, the kernel
@@ -146,6 +144,14 @@ impl NbdService {
     }
 }
 
+/// Parse the index of an NBD device from its path, e.g. 3 for `/dev/nbd3`.
+fn device_index(path: &str) -> Result<u32> {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str()?.strip_prefix("nbd")?.parse().ok())
+        .ok_or_else(|| einval!(format!("invalid NBD device path {}", path)))
+}
+
 /// A worker to handle NBD requests in asynchronous mode.
 pub struct NbdWorker {
     active: Arc<AtomicBool>,
@@ -158,9 +164,9 @@ pub struct NbdWorker {
 impl NbdWorker {
     /// Run the event loop to handle NBD requests from kernel in asynchronous mode.
     ///
-    /// Requests are served concurrently, up to [NBD_MAX_INFLIGHT_UNITS] of data at a time: the
-    /// kernel sends every request of a queue on the same connection, so serving them one at a
-    /// time would serialize all reads of the device, each one possibly waiting on the backend.
+    /// Requests are served concurrently, up to [NBD_MAX_INFLIGHT_BYTES] at a time: the kernel
+    /// sends every request of a queue on the same connection, so serving them one at a time
+    /// would serialize all reads of the device, each one possibly waiting on the backend.
     pub async fn run(self) {
         let device =
             match BlockDevice::new_with_cache_manager(self.blob_id.clone(), self.cache_mgr.clone())
@@ -177,8 +183,8 @@ impl NbdWorker {
 
         // Safe because the socket is moved out of the worker, it has a single owner.
         let sock = Rc::new(unsafe { UnixStream::from_raw_fd(self.sock_user.into_raw_fd()) });
-        let reply_lock = Rc::new(tokio::sync::Mutex::new(()));
-        let inflight = Arc::new(tokio::sync::Semaphore::new(NBD_MAX_INFLIGHT_UNITS as usize));
+        let reply_lock = Rc::new(AsyncMutex::new(()));
+        let inflight = Arc::new(Semaphore::new(NBD_MAX_INFLIGHT_BYTES as usize));
         let mut receiver = self.sender.subscribe();
         let mut buf = vec![0u8; NBD_REQUEST_HEADER_SIZE];
         let mut pos = 0;
@@ -200,13 +206,9 @@ impl NbdWorker {
                                 if (&buf[4..]).get_u32() == NBD_CMD_DISC {
                                     break;
                                 }
-                                let units = (&buf[24..])
-                                    .get_u32()
-                                    .div_ceil(NBD_INFLIGHT_UNIT)
-                                    .clamp(1, NBD_MAX_INFLIGHT_UNITS);
-                                let permit = match inflight.clone().acquire_many_owned(units).await {
-                                    Ok(v) => v,
-                                    Err(_) => break,
+                                let len = (&buf[24..]).get_u32().clamp(1, NBD_MAX_INFLIGHT_BYTES);
+                                let Ok(permit) = inflight.clone().acquire_many_owned(len).await else {
+                                    break;
                                 };
                                 let (request, sock, device) = (buf.clone(), sock.clone(), device.clone());
                                 let (reply_lock, blob_id) = (reply_lock.clone(), self.blob_id.clone());
@@ -227,14 +229,14 @@ impl NbdWorker {
         }
 
         // Let the requests being served finish before the socket gets closed.
-        let _ = inflight.acquire_many(NBD_MAX_INFLIGHT_UNITS).await;
+        let _ = inflight.acquire_many(NBD_MAX_INFLIGHT_BYTES).await;
     }
 
     async fn handle_request(
         mut request: &[u8],
         sock: &UnixStream,
         device: &Rc<BlockDevice>,
-        reply_lock: &tokio::sync::Mutex<()>,
+        reply_lock: &AsyncMutex<()>,
     ) -> Result<()> {
         let magic = request.get_u32();
         let ty = request.get_u32();
@@ -254,7 +256,7 @@ impl NbdWorker {
         } else if ty == NBD_CMD_READ {
             let start = (pos / block_size) as u32;
             let count = len / block_size as u32;
-            match BlockDevice::async_read_pieces(device, start, count, NBD_READ_PIECE).await {
+            match device.async_read_pieces(start, count, NBD_READ_PIECE).await {
                 Ok(v) => data = v,
                 Err(e) => {
                     warn!("block_nbd: failed to read data from block device, {}", e);
@@ -280,10 +282,6 @@ impl NbdWorker {
         Ok(())
     }
 }
-
-/// Seconds the kernel queues the requests of a device whose server died, waiting for a new server
-/// to take it over.
-const NBD_DEAD_CONN_TIMEOUT: u64 = 600;
 
 /// A [NydusDaemon] implementation to expose RAFS v6 images as block devices through NBD.
 pub struct NbdDaemon {
@@ -323,12 +321,7 @@ impl NbdDaemon {
         // A new daemon serving the same image takes the device over.
         let backend_id = id.clone().unwrap_or_else(|| nbd_path.clone());
         #[allow(clippy::arc_with_non_send_sync)]
-        let nbd_service = NbdService::new(
-            Arc::new(block_device),
-            device_index(&nbd_path)?,
-            NBD_DEAD_CONN_TIMEOUT,
-            backend_id,
-        )?;
+        let nbd_service = NbdService::new(Arc::new(block_device), nbd_path, backend_id)?;
 
         Ok(NbdDaemon {
             cache_mgr,
@@ -388,13 +381,13 @@ impl NydusDaemon for NbdDaemon {
 
     fn start(&self) -> NydusResult<()> {
         info!("start NBD service with {} worker threads", self.nbd_threads);
-        let workers = self
-            .service
-            .attach(self.nbd_threads)
-            .map_err(|e| NydusError::StartService(format!("attach NBD device, {}", e)))?;
-        for worker in workers {
+        for _ in 0..self.nbd_threads {
             let waker = self.waker.clone();
             let active = self.service.active.clone();
+            let worker = self
+                .service
+                .create_worker()
+                .map_err(|e| NydusError::StartService(format!("{}", e)))?;
             let thread = std::thread::Builder::new()
                 .name("nbd_worker".to_string())
                 .spawn(move || {
@@ -416,7 +409,9 @@ impl NydusDaemon for NbdDaemon {
             self.nbd_service_threads.lock().unwrap().push(thread);
         }
 
-        Ok(())
+        self.service
+            .connect()
+            .map_err(|e| NydusError::StartService(format!("connect NBD device, {}", e)))
     }
 
     fn umount(&self) -> NydusResult<()> {
@@ -595,6 +590,20 @@ mod tests {
         Ok(Arc::new(device))
     }
 
+    #[test]
+    fn test_device_index() {
+        let tests = [
+            ("/dev/nbd0", Some(0)),
+            ("/dev/nbd17", Some(17)),
+            ("nbd3", Some(3)),
+            ("/dev/sda", None),
+            ("/dev/nbd", None),
+        ];
+        for (path, want) in tests {
+            assert_eq!(device_index(path).ok(), want, "{path}");
+        }
+    }
+
     // Requires root and the nbd module.
     #[ignore]
     #[test]
@@ -604,21 +613,23 @@ mod tests {
         tokio_uring::start(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-            let nbd = NbdService::new(device, 15, 30, "test_nbd_device".to_string()).unwrap();
+            let nbd =
+                NbdService::new(device, "/dev/nbd15".to_string(), "test".to_string()).unwrap();
+            let start = |nbd: &NbdService| {
+                for _ in 0..2 {
+                    let worker = nbd.create_worker().unwrap();
+                    tokio_uring::spawn(async move { worker.run().await });
+                }
+                nbd.connect().unwrap();
+            };
             assert!(!connected());
-            let workers = nbd.attach(2).unwrap();
+            start(&nbd);
             assert!(connected());
-            for worker in workers {
-                tokio_uring::spawn(async move { worker.run().await });
-            }
             tokio::time::sleep(Duration::from_millis(100)).await;
             // A new server takes the device over once the previous one stopped.
             nbd.stop();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let workers = nbd.attach(2).unwrap();
-            for worker in workers {
-                tokio_uring::spawn(async move { worker.run().await });
-            }
+            start(&nbd);
             nbd.disconnect().unwrap();
             // The device goes back to the pool: it must survive the disconnect.
             for _ in 0..50 {

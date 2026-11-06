@@ -599,7 +599,7 @@ fn process_singleton_arguments(
 #[cfg(feature = "block-nbd")]
 mod nbd {
     use super::*;
-    use nydus_api::BlobCacheEntry;
+    use nydus_api::{BlobCacheEntry, BlobCacheEntryConfigV2};
     use nydus_service::block_nbd::create_nbd_daemon;
     use std::str::FromStr;
 
@@ -649,7 +649,15 @@ mod nbd {
             (args.value_of("bootstrap"), args.value_of("config"))
         {
             // A RAFS configuration, as taken by `nydusd fuse`.
-            rafs_config_to_blob_entry(config, bootstrap)?
+            let mut config = BlobCacheEntryConfigV2::try_from(&ConfigV2::from_file(config)?)?;
+            config.metadata_path = Some(bootstrap.to_string());
+            serde_json::from_value(serde_json::json!({
+                "type": "bootstrap",
+                "id": "disk-default",
+                "domain_id": "block-nbd",
+                "config_v2": config,
+            }))
+            .map_err(|e| einval!(e))?
         } else if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args.value_of("localfs-dir").ok_or_else(|| {
                 einval!("option `-D/--localfs-dir` is required by `--boootstrap`")
@@ -727,67 +735,6 @@ mod nbd {
         DAEMON_CONTROLLER.set_daemon(daemon);
 
         Ok(())
-    }
-
-    /// Build the blob cache entry of a block device from a RAFS configuration and its bootstrap.
-    fn rafs_config_to_blob_entry(config: &str, bootstrap: &str) -> Result<BlobCacheEntry> {
-        let cfg = ConfigV2::from_file(config)?;
-        let backend = cfg
-            .backend
-            .as_ref()
-            .ok_or_else(|| einval!("no backend in configuration file"))?;
-        let cache = cfg
-            .cache
-            .as_ref()
-            .ok_or_else(|| einval!("no cache in configuration file"))?;
-        let entry = serde_json::json!({
-            "type": "bootstrap",
-            "id": "disk-default",
-            "domain_id": "block-nbd",
-            "config_v2": {
-                "version": 2,
-                "id": "block-nbd-factory",
-                "backend": backend,
-                "external_backends": cfg.external_backends,
-                "cache": cache,
-                // Carries amplify_io: without it the block device fetches missing data one chunk
-                // per backend request, instead of batching the following chunks as RAFS does.
-                "rafs": cfg.rafs,
-                "metadata_path": bootstrap,
-            },
-        });
-        BlobCacheEntry::from_str(&entry.to_string())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::rafs_config_to_blob_entry;
-        use vmm_sys_util::tempfile::TempFile;
-
-        #[test]
-        fn test_rafs_config_to_blob_entry() {
-            let tests = [
-                (
-                    "V1AmplifyIO",
-                    r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct","amplify_io":10485760}"#,
-                    10485760,
-                ),
-                (
-                    "V1DefaultAmplifyIO",
-                    r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct"}"#,
-                    1048576,
-                ),
-            ];
-            for (name, config, want) in tests {
-                let file = TempFile::new().unwrap();
-                std::fs::write(file.as_path(), config).unwrap();
-                let entry =
-                    rafs_config_to_blob_entry(file.as_path().to_str().unwrap(), "/tmp/boot")
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                let rafs = entry.blob_config.as_ref().unwrap().rafs.as_ref();
-                assert_eq!(rafs.map(|r| r.user_io_batch_size), Some(want), "{name}");
-            }
-        }
     }
 }
 

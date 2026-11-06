@@ -334,17 +334,17 @@ impl BlockDevice {
     /// all the blocks is fetched in one go: a single stream of reads of the blob cache does not
     /// reach the bandwidth of local disks.
     pub async fn async_read_pieces(
-        device: &Rc<Self>,
+        self: &Rc<Self>,
         start: u32,
         blocks: u32,
         piece_size: u64,
     ) -> Result<Vec<Vec<u8>>> {
-        device.async_fetch(start, blocks).await?;
-        let piece_blocks = max(1, piece_size / device.block_size()) as u32;
+        self.async_fetch(start, blocks).await?;
+        let piece_blocks = max(1, piece_size / self.block_size()) as u32;
         let (mut pos, end) = (start, start + blocks);
         let mut reads = Vec::new();
         while pos < end {
-            let (device, count) = (device.clone(), min(piece_blocks, end - pos));
+            let (device, count) = (self.clone(), min(piece_blocks, end - pos));
             reads.push(tokio_uring::spawn(async move {
                 let size = device.blocks_to_size(count) as usize;
                 match device.async_read(pos, count, alloc_buf(size)).await {
@@ -761,15 +761,14 @@ mod tests {
                 ("SmallerThanBlock", 1, blocks as usize),
             ];
             for (name, piece_size, want) in tests {
-                let pieces = BlockDevice::async_read_pieces(&device, 0, blocks, piece_size)
+                let pieces = device
+                    .async_read_pieces(0, blocks, piece_size)
                     .await
                     .unwrap();
                 assert_eq!(pieces.len(), want, "{}", name);
                 assert_eq!(pieces.concat(), whole, "{}", name);
             }
-            assert!(BlockDevice::async_read_pieces(&device, blocks, 1, 8192)
-                .await
-                .is_err());
+            assert!(device.async_read_pieces(blocks, 1, 8192).await.is_err());
         })
     }
 

@@ -1081,6 +1081,22 @@ impl From<&BlobCacheEntryConfigV2> for ConfigV2 {
     }
 }
 
+impl TryFrom<&ConfigV2> for BlobCacheEntryConfigV2 {
+    type Error = Error;
+
+    fn try_from(c: &ConfigV2) -> Result<Self> {
+        Ok(BlobCacheEntryConfigV2 {
+            version: c.version,
+            id: c.id.clone(),
+            backend: c.get_backend_config()?.clone(),
+            external_backends: c.external_backends.clone(),
+            cache: c.get_cache_config()?.clone(),
+            metadata_path: None,
+            rafs: c.rafs.clone(),
+        })
+    }
+}
+
 /// Internal runtime configuration.
 #[derive(Clone, Debug)]
 pub struct ConfigV2Internal {
@@ -2235,6 +2251,30 @@ mod tests {
         let config = ConfigV2::new_localfs("id1", "./").unwrap();
         assert_eq!(&config.id, "id1");
         assert_eq!(config.backend.as_ref().unwrap().backend_type, "localfs");
+    }
+
+    #[test]
+    fn test_blob_cache_entry_config_from_rafs_config() {
+        let tests = [
+            (
+                "AmplifyIO",
+                r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct","amplify_io":10485760}"#,
+                Some(10485760),
+            ),
+            (
+                "DefaultAmplifyIO",
+                r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct"}"#,
+                Some(1048576),
+            ),
+            ("NoBackend", r#"{"version":2,"id":"id"}"#, None),
+        ];
+        for (name, config, want) in tests {
+            let config = ConfigV2::from_str(config).unwrap();
+            let got = BlobCacheEntryConfigV2::try_from(&config)
+                .ok()
+                .map(|c| c.rafs.unwrap().user_io_batch_size);
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
