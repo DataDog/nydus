@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 
 use bytes::{Buf, BufMut};
 use mio::Waker;
+use nix::mount::{mount, umount, MsFlags};
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use tokio::sync::broadcast::{channel, Sender};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -145,6 +146,14 @@ impl NbdService {
 }
 
 /// Parse the index of an NBD device from its path, e.g. 3 for `/dev/nbd3`.
+fn is_mounted(mountpoint: &str) -> NydusResult<bool> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts")
+        .map_err(|e| NydusError::StartService(format!("read mounts, {}", e)))?;
+    Ok(mounts
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(mountpoint)))
+}
+
 fn device_index(path: &str) -> Result<u32> {
     std::path::Path::new(path)
         .file_name()
@@ -292,6 +301,8 @@ pub struct NbdDaemon {
     id: Option<String>,
     supervisor: Option<String>,
 
+    nbd_path: String,
+    mountpoint: Option<String>,
     nbd_threads: u32,
     nbd_service_threads: Mutex<Vec<JoinHandle<Result<()>>>>,
     request_sender: Arc<Mutex<std::sync::mpsc::Sender<DaemonStateMachineInput>>>,
@@ -305,6 +316,7 @@ impl NbdDaemon {
     #[allow(clippy::too_many_arguments)]
     fn new(
         nbd_path: String,
+        mountpoint: Option<String>,
         threads: u32,
         blob_entry: BlobCacheEntry,
         trigger: std::sync::mpsc::Sender<DaemonStateMachineInput>,
@@ -321,7 +333,7 @@ impl NbdDaemon {
         // A new daemon serving the same image takes the device over.
         let backend_id = id.clone().unwrap_or_else(|| nbd_path.clone());
         #[allow(clippy::arc_with_non_send_sync)]
-        let nbd_service = NbdService::new(Arc::new(block_device), nbd_path, backend_id)?;
+        let nbd_service = NbdService::new(Arc::new(block_device), nbd_path.clone(), backend_id)?;
 
         Ok(NbdDaemon {
             cache_mgr,
@@ -331,6 +343,8 @@ impl NbdDaemon {
             id,
             supervisor,
 
+            nbd_path,
+            mountpoint,
             nbd_threads: threads,
             nbd_service_threads: Mutex::new(Vec::new()),
             state: AtomicI32::new(DaemonState::INIT as i32),
@@ -411,10 +425,30 @@ impl NydusDaemon for NbdDaemon {
 
         self.service
             .connect()
-            .map_err(|e| NydusError::StartService(format!("connect NBD device, {}", e)))
+            .map_err(|e| NydusError::StartService(format!("connect NBD device, {}", e)))?;
+        // A daemon taking over the device after a crash finds the image still mounted.
+        match &self.mountpoint {
+            Some(mp) if !is_mounted(mp)? => mount(
+                Some(self.nbd_path.as_str()),
+                mp.as_str(),
+                Some("erofs"),
+                MsFlags::MS_RDONLY,
+                None::<&str>,
+            )
+            .map_err(|e| {
+                NydusError::StartService(format!("mount {} on {}, {}", self.nbd_path, mp, e))
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn umount(&self) -> NydusResult<()> {
+        if let Some(mp) = &self.mountpoint {
+            if is_mounted(mp)? {
+                umount(mp.as_str())
+                    .map_err(|e| NydusError::StartService(format!("umount {}, {}", mp, e)))?;
+            }
+        }
         self.service
             .disconnect()
             .map_err(|e| NydusError::StartService(format!("disconnect NBD device, {}", e)))
@@ -488,6 +522,7 @@ impl NydusDaemon for NbdDaemon {
 #[allow(clippy::too_many_arguments)]
 pub fn create_nbd_daemon(
     device: String,
+    mountpoint: Option<String>,
     threads: u32,
     blob_entry: BlobCacheEntry,
     bti: BuildTimeInfo,
@@ -499,6 +534,7 @@ pub fn create_nbd_daemon(
     let (result_sender, result_receiver) = std::sync::mpsc::channel::<NydusResult<()>>();
     let daemon = NbdDaemon::new(
         device,
+        mountpoint,
         threads,
         blob_entry,
         trigger,

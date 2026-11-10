@@ -636,6 +636,13 @@ mod nbd {
                     .help("Number of worker threads to serve NBD requests")
                     .value_parser(thread_validator)
                     .required(false),
+            )
+            .arg(
+                Arg::new("mountpoint")
+                    .long("mountpoint")
+                    .short('M')
+                    .help("Mount the block device read-only as EROFS at this path")
+                    .required(false),
             );
         cmd.subcommand(subcmd)
     }
@@ -716,8 +723,11 @@ mod nbd {
             .map(|n| n.parse().unwrap_or(1))
             .unwrap_or(1);
 
+        let mountpoint = args.value_of("mountpoint").map(|m| m.to_string());
+
         let daemon = create_nbd_daemon(
             device,
+            mountpoint,
             threads,
             entry,
             bti,
