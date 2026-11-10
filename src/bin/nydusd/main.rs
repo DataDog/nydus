@@ -599,7 +599,7 @@ fn process_singleton_arguments(
 #[cfg(feature = "block-nbd")]
 mod nbd {
     use super::*;
-    use nydus_api::BlobCacheEntry;
+    use nydus_api::{BlobCacheEntry, BlobCacheEntryConfigV2};
     use nydus_service::block_nbd::create_nbd_daemon;
     use std::str::FromStr;
 
@@ -617,9 +617,7 @@ mod nbd {
                 Arg::new("bootstrap")
                     .long("bootstrap")
                     .short('B')
-                    .help("Path to the RAFS filesystem metadata file")
-                    .requires("localfs-dir")
-                    .conflicts_with("config"),
+                    .help("Path to the RAFS filesystem metadata file"),
             )
             .arg(
                 Arg::new("localfs-dir")
@@ -638,6 +636,13 @@ mod nbd {
                     .help("Number of worker threads to serve NBD requests")
                     .value_parser(thread_validator)
                     .required(false),
+            )
+            .arg(
+                Arg::new("mountpoint")
+                    .long("mountpoint")
+                    .short('M')
+                    .help("Mount the block device read-only as EROFS at this path")
+                    .required(false),
             );
         cmd.subcommand(subcmd)
     }
@@ -647,7 +652,20 @@ mod nbd {
         bti: BuildTimeInfo,
         _apisock: Option<&str>,
     ) -> Result<()> {
-        let mut entry = if let Some(bootstrap) = args.value_of("bootstrap") {
+        let mut entry = if let (Some(bootstrap), Some(config)) =
+            (args.value_of("bootstrap"), args.value_of("config"))
+        {
+            // A RAFS configuration, as taken by `nydusd fuse`.
+            let mut config = BlobCacheEntryConfigV2::try_from(&ConfigV2::from_file(config)?)?;
+            config.metadata_path = Some(bootstrap.to_string());
+            serde_json::from_value(serde_json::json!({
+                "type": "bootstrap",
+                "id": "disk-default",
+                "domain_id": "block-nbd",
+                "config_v2": config,
+            }))
+            .map_err(|e| einval!(e))?
+        } else if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args.value_of("localfs-dir").ok_or_else(|| {
                 einval!("option `-D/--localfs-dir` is required by `--boootstrap`")
             })?;
@@ -705,8 +723,11 @@ mod nbd {
             .map(|n| n.parse().unwrap_or(1))
             .unwrap_or(1);
 
+        let mountpoint = args.value_of("mountpoint").map(|m| m.to_string());
+
         let daemon = create_nbd_daemon(
             device,
+            mountpoint,
             threads,
             entry,
             bti,

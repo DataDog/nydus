@@ -1012,6 +1012,9 @@ pub struct BlobCacheEntryConfigV2 {
     /// Optional file path for metadata blob.
     #[serde(default)]
     pub metadata_path: Option<String>,
+    /// Optional RAFS configuration, its `batch_size` amplifies reads of the blob data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rafs: Option<RafsConfigV2>,
 }
 
 impl BlobCacheEntryConfigV2 {
@@ -1071,10 +1074,26 @@ impl From<&BlobCacheEntryConfigV2> for ConfigV2 {
             backend: Some(c.backend.clone()),
             external_backends: c.external_backends.clone(),
             cache: Some(c.cache.clone()),
-            rafs: None,
+            rafs: c.rafs.clone(),
             overlay: None,
             internal: ConfigV2Internal::default(),
         }
+    }
+}
+
+impl TryFrom<&ConfigV2> for BlobCacheEntryConfigV2 {
+    type Error = Error;
+
+    fn try_from(c: &ConfigV2) -> Result<Self> {
+        Ok(BlobCacheEntryConfigV2 {
+            version: c.version,
+            id: c.id.clone(),
+            backend: c.get_backend_config()?.clone(),
+            external_backends: c.external_backends.clone(),
+            cache: c.get_cache_config()?.clone(),
+            metadata_path: None,
+            rafs: c.rafs.clone(),
+        })
     }
 }
 
@@ -1599,6 +1618,7 @@ impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
             external_backends: v.external_backends.clone(),
             cache: (&cache_config).try_into()?,
             metadata_path: v.metadata_path.clone(),
+            rafs: None,
         })
     }
 }
@@ -2231,6 +2251,30 @@ mod tests {
         let config = ConfigV2::new_localfs("id1", "./").unwrap();
         assert_eq!(&config.id, "id1");
         assert_eq!(config.backend.as_ref().unwrap().backend_type, "localfs");
+    }
+
+    #[test]
+    fn test_blob_cache_entry_config_from_rafs_config() {
+        let tests = [
+            (
+                "AmplifyIO",
+                r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct","amplify_io":10485760}"#,
+                Some(10485760),
+            ),
+            (
+                "DefaultAmplifyIO",
+                r#"{"device":{"backend":{"type":"localfs","config":{"dir":"/tmp"}},"cache":{"type":"blobcache","config":{"work_dir":"/tmp"}}},"mode":"direct"}"#,
+                Some(1048576),
+            ),
+            ("NoBackend", r#"{"version":2,"id":"id"}"#, None),
+        ];
+        for (name, config, want) in tests {
+            let config = ConfigV2::from_str(config).unwrap();
+            let got = BlobCacheEntryConfigV2::try_from(&config)
+                .ok()
+                .map(|c| c.rafs.unwrap().user_io_batch_size);
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
