@@ -1097,6 +1097,32 @@ impl TryFrom<&ConfigV2> for BlobCacheEntryConfigV2 {
     }
 }
 
+/// Configuration of `nydusd nbd`, the `nbd` section of a configuration file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NbdConfig {
+    /// Seconds before the kernel retries a request without reply, 0 for the kernel default.
+    #[serde(default)]
+    pub timeout: u64,
+    /// Attributes of the block queue of the device, e.g. `read_ahead_kb`.
+    #[serde(default)]
+    pub queue_attributes: HashMap<String, String>,
+}
+
+impl NbdConfig {
+    /// Load the `nbd` section of the configuration file at `path`.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct File {
+            #[serde(default)]
+            nbd: NbdConfig,
+        }
+        let content = fs::read_to_string(path)?;
+        let file: File =
+            serde_json::from_str(&content).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        Ok(file.nbd)
+    }
+}
+
 /// Internal runtime configuration.
 #[derive(Clone, Debug)]
 pub struct ConfigV2Internal {

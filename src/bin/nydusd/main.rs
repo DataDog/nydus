@@ -599,6 +599,7 @@ fn process_singleton_arguments(
 #[cfg(feature = "block-nbd")]
 mod nbd {
     use super::*;
+    use nydus_api::NbdConfig;
     use nydus_api::{BlobCacheEntry, BlobCacheEntryConfigV2};
     use nydus_service::block_nbd::create_nbd_daemon;
     use std::str::FromStr;
@@ -643,6 +644,13 @@ mod nbd {
                     .short('M')
                     .help("Mount the block device read-only as EROFS at this path")
                     .required(false),
+            )
+            .arg(
+                Arg::new("netlink")
+                    .long("netlink")
+                    .help("Configure the NBD device through netlink: a new nydusd takes over the device of a previous one")
+                    .action(ArgAction::SetTrue)
+                    .required(false),
             );
         cmd.subcommand(subcmd)
     }
@@ -650,7 +658,7 @@ mod nbd {
     pub(super) fn process_nbd_service(
         args: SubCmdArgs,
         bti: BuildTimeInfo,
-        _apisock: Option<&str>,
+        apisock: Option<&str>,
     ) -> Result<()> {
         let mut entry = if let (Some(bootstrap), Some(config)) =
             (args.value_of("bootstrap"), args.value_of("config"))
@@ -724,10 +732,19 @@ mod nbd {
             .unwrap_or(1);
 
         let mountpoint = args.value_of("mountpoint").map(|m| m.to_string());
+        let netlink = args.is_present("netlink");
+        let config = match args.value_of("config") {
+            Some(config) => NbdConfig::from_file(config)?,
+            None => NbdConfig::default(),
+        };
 
         let daemon = create_nbd_daemon(
             device,
+            netlink,
+            args.is_present("upgrade"),
+            apisock.map(|s| s.to_string()),
             mountpoint,
+            config,
             threads,
             entry,
             bti,

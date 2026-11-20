@@ -37,6 +37,7 @@ const NBD_CMD_RECONFIGURE: u8 = 3;
 const NBD_ATTR_INDEX: u16 = 1;
 const NBD_ATTR_SIZE_BYTES: u16 = 2;
 const NBD_ATTR_BLOCK_SIZE_BYTES: u16 = 3;
+const NBD_ATTR_TIMEOUT: u16 = 4;
 const NBD_ATTR_SERVER_FLAGS: u16 = 5;
 const NBD_ATTR_SOCKETS: u16 = 7;
 const NBD_ATTR_DEAD_CONN_TIMEOUT: u16 = 8;
@@ -50,6 +51,8 @@ pub struct DeviceConfig {
     pub size_bytes: u64,
     pub block_size: u64,
     pub server_flags: u64,
+    /// Seconds before the kernel retries a request without reply, 0 for the kernel default.
+    pub timeout: u64,
     /// Seconds the kernel waits for a new connection before failing requests, once all the
     /// connections of the device are dead.
     pub dead_conn_timeout: u64,
@@ -214,6 +217,9 @@ impl NbdNetlink {
             .put_u64(NBD_ATTR_DEAD_CONN_TIMEOUT, cfg.dead_conn_timeout)
             .put_str(NBD_ATTR_BACKEND_IDENTIFIER, &cfg.backend_id)
             .put_nested(NBD_ATTR_SOCKETS, &sockets);
+        if cfg.timeout != 0 {
+            attrs.put_u64(NBD_ATTR_TIMEOUT, cfg.timeout);
+        }
         attrs
     }
 
