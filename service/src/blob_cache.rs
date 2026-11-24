@@ -528,11 +528,16 @@ impl DataBlob {
 
     /// Read data from the cached data blob in asynchronous mode.
     pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
-        match self.blob.get_blob_object() {
-            Some(obj) => match obj.fetch_range_uncompressed(pos, buf.bytes_total() as u64) {
-                Ok(_) => self.file.read_at(buf, pos).await,
-                Err(e) => (Err(e), buf),
-            },
+        // Fetching blocks: run it on the blocking thread pool, not to stall the other requests
+        // served by the calling runtime.
+        let (blob, size) = (self.blob.clone(), buf.bytes_total() as u64);
+        let fetch = move || {
+            blob.get_blob_object()
+                .map(|obj| obj.fetch_range_uncompressed(pos, size))
+        };
+        match tokio::task::spawn_blocking(fetch).await.unwrap_or(None) {
+            Some(Ok(_)) => self.file.read_at(buf, pos).await,
+            Some(Err(e)) => (Err(e), buf),
             None => (
                 Err(eio!(format!(
                     "blob_cache: failed to get BlobObject for blob {}",
